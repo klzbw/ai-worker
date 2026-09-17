@@ -31,6 +31,8 @@ if hasattr(sys.stdout, 'reconfigure'):
 # 子进程(sep_once/align_once)会继承本环境变量：让 Demucs/Whisper/对齐模型默认走 hf-mirror，
 # 避免国内直连 HuggingFace 超时导致任务全失败；用户已设置 HF_ENDPOINT 时不覆盖。
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+# 缓解多任务并发时的 CUDA 显存碎片/峰值，降低 OOM 概率（子进程 sep_once/align_once 会继承）
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 # ---------- ffmpeg / ffprobe 路径探测（纯音乐跳过时生成静音/复制用） ----------
 def _pick_exe(name, fallback):
@@ -162,29 +164,101 @@ class MomoWorker:
             with open(dst, 'wb') as f:
                 for chunk in r.iter_content(1 << 20):
                     f.write(chunk)
+        # .strm 文本指针解析：部分网络歌曲(is_network=1)在服务端的源文件其实是一个 .strm
+        # 文本文件，内容是指向 Alist/115 上真实音频的 URL。worker 若把这段文本存成
+        # source.audio 交给 ffmpeg，会报 Invalid data found（历史 698 个对齐任务全部因此失败）。
+        url = self._strm_url_of(dst)
+        if url:
+            log('.strm 指针：跟随 URL 下载真实音频...')
+            dst = self._fetch_strm_target(url, dst)
         return dst
 
+    # 判断本地文件是否是 .strm 文本指针（极小文本，内容是一个 http(s) URL）。是则返回 URL。
+    def _strm_url_of(self, path):
+        try:
+            sz = os.path.getsize(path)
+            if sz <= 0 or sz > 32 * 1024:
+                return None
+            with open(path, 'rb') as f:
+                data = f.read()
+            txt = data.decode('utf-8', 'replace').strip()
+            if txt.startswith('http://') or txt.startswith('https://'):
+                return txt
+        except Exception:
+            pass
+        return None
+
+    # 跟随 .strm 里的 URL 下载真实音频，替换文本指针文件，返回真实音频本地路径。
+    # 115 CDN 偶发 403/限流，最多重试 2 次（指数退避）。
+    def _fetch_strm_target(self, url, text_dst):
+        path_part = urllib.parse.urlparse(url).path
+        ext = os.path.splitext(path_part)[1].lower()
+        if ext not in ('.flac', '.wav', '.mp3', '.m4a', '.ogg', '.ape', '.dts', '.tta', '.wma'):
+            ext = '.flac'
+        real_dst = os.path.splitext(text_dst)[0] + ext
+        last_exc = None
+        for attempt in range(3):
+            try:
+                with self.s.get(url, stream=True, timeout=600) as r:
+                    if r.status_code in (403, 429, 500, 502, 503, 504):
+                        raise RuntimeError(f'源站 HTTP {r.status_code}（可能限流）')
+                    r.raise_for_status()
+                    with open(real_dst, 'wb') as f:
+                        for chunk in r.iter_content(1 << 20):
+                            f.write(chunk)
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                if attempt < 2:
+                    wait = 3 * (attempt + 1)
+                    log(f'.strm 下载第{attempt+1}次失败({e})，{wait}s后重试...')
+                    time.sleep(wait)
+        if last_exc:
+            raise last_exc
+        try:
+            if os.path.abspath(real_dst) != os.path.abspath(text_dst):
+                os.remove(text_dst)
+        except Exception:
+            pass
+        log('.strm 解析完成: %s (%.1f MB)' % (real_dst, os.path.getsize(real_dst) / 1e6))
+        return real_dst
+
     # 调子进程脚本，实时把进度回传
-    def run_child(self, script, args, job_id, progress_map):
+    def run_child(self, script, args, job_id, progress_map, timeout=1800):
         cmd = [self.py, os.path.join(self.here, script)] + args
         log('$', ' '.join(cmd))
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding='utf-8', errors='replace', bufsize=1)
-        lines = []
-        for line in proc.stdout:
-            line = line.rstrip()
-            lines.append(line)
-            print('   |', line, flush=True)
-            # 子进程打印 PROGRESS 35 这样的行 -> 回传进度 + 更新本地状态供 GUI
-            if line.startswith('PROGRESS '):
-                try:
-                    p = int(line.split()[1])
-                    self.progress(job_id, p)
-                    if self.current_job: self.current_job['progress'] = p
+        timed_out = [False]
+        def _watchdog():
+            time.sleep(timeout)
+            if proc.poll() is None:
+                timed_out[0] = True
+                log(f'子进程超时({timeout}s)，强制终止: {script}')
+                try: proc.kill()
                 except Exception: pass
-        proc.wait()
+        wd = threading.Thread(target=_watchdog, daemon=True)
+        wd.start()
+        lines = []
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                lines.append(line)
+                print('   |', line, flush=True)
+                if line.startswith('PROGRESS '):
+                    try:
+                        p = int(line.split()[1])
+                        self.progress(job_id, p)
+                        if self.current_job: self.current_job['progress'] = p
+                    except Exception: pass
+            proc.wait()
+        finally:
+            wd.join(timeout=1)
+        if timed_out[0]:
+            raise RuntimeError(f'{script} 执行超时({timeout}s)，已强制终止')
         if proc.returncode != 0:
-            raise RuntimeError(f'{script} 退出码 {proc.returncode}: ' + '\n'.join(lines[-15:]))
+            raise RuntimeError(f'{script} 退出码 {proc.returncode}: ' + chr(10).join(lines[-15:]))
 
     def handle(self, task):
         job = task['job']; song = task['song']; kind = job['type']; job_id = job['id']
@@ -213,7 +287,7 @@ class MomoWorker:
                     self._make_instrumental_align(word)
                 else:
                     # 对齐优先用分离出的纯人声（更准）；没有就用源音频
-                    vocal_src = self._separated_vocal(job['songId']) or src
+                    vocal_src = self._separated_vocal(job['songId'], tmp) or src
                     args = [vocal_src, word]
                     # 官方参考歌词：优先用任务下发的；为空则当场向服务端要一次（本地同名lrc优先，
                     # 缺则在线网易云/QQ/酷我三源补抓并入库），尽量让每首都能"官方文字+精准时间"
@@ -235,9 +309,25 @@ class MomoWorker:
             try:
                 self.progress(job_id, 95)
                 if self.current_job: self.current_job['progress'] = 95
-                r = self.s.post(f'{self.server}/api/separate/jobs/{job_id}/complete',
-                                files=files, timeout=600)
-                r.raise_for_status()
+                # 回传结果：带 3 次重试，服务端偶发 500 / 网络抖动时自动重试
+                last_exc = None
+                for attempt in range(3):
+                    try:
+                        for _, v in files.items():
+                            try: v[1].seek(0)
+                            except Exception: pass
+                        r = self.s.post(f'{self.server}/api/separate/jobs/{job_id}/complete',
+                                        files=files, timeout=120)
+                        r.raise_for_status()
+                        last_exc = None
+                        break
+                    except Exception as e:
+                        last_exc = e
+                        if attempt < 2:
+                            log(f'回传失败(第{attempt+1}/3次)，5秒后重试: {e}')
+                            time.sleep(5)
+                if last_exc:
+                    raise last_exc
                 log(f'任务 #{job_id} 完成并回传:', r.json())
                 self.done_count += 1
             finally:
@@ -256,9 +346,34 @@ class MomoWorker:
     def _ext(self, task):
         return '.wav'
 
-    # 若这首歌已分离，直接取服务端产物（对齐用纯人声更准）。没有返回 None。
-    def _separated_vocal(self, song_id):
-        return None  # 简化：对齐直接用源；后续可扩展下载 /data/separated 下的人声
+    # 若这首歌已分离(sep_status=done)，从服务端下载纯人声 FLAC 到临时目录用于对齐（比源音频准）。
+    # 服务端已有 GET /api/songs/:id/sep-track?kind=vocal 直接出分轨文件；网络歌曲的分离产物在 115
+    # （本地无文件）会返回 404，此时回退 None，由 download() 的 .strm 解析去拿真实人声。
+    def _separated_vocal(self, song_id, tmp):
+        try:
+            r = self.s.get(f'{self.server}/api/songs/{song_id}/sep-track',
+                           params={'kind': 'vocal'}, timeout=30, stream=True)
+            if r.status_code != 200:
+                r.close()
+                return None
+            ct = (r.headers.get('Content-Type') or '')
+            ext = '.flac' if 'wav' not in ct else '.wav'
+            path_ext = os.path.splitext(urllib.parse.urlparse(r.url).path)[1].lower()
+            if path_ext in ('.flac', '.wav', '.mp3', '.m4a'):
+                ext = path_ext
+            vocal_path = os.path.join(tmp, f'sep_vocal{ext}')
+            with open(vocal_path, 'wb') as f:
+                for chunk in r.iter_content(1 << 20):
+                    f.write(chunk)
+            r.close()
+            if os.path.getsize(vocal_path) > 1024:
+                log(f'已下载分离人声 {os.path.getsize(vocal_path)//1024}KB 用于对齐')
+                return vocal_path
+            try: os.remove(vocal_path)
+            except Exception: pass
+        except Exception as e:
+            log('下载分离人声失败(回退源音频):', e)
+        return None
 
     # ---------- 纯音乐/轻音乐/无人声 快速处理（跳过人声分离和歌词对齐） ----------
     def _get_audio_duration(self, src):

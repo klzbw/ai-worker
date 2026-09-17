@@ -36,6 +36,10 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+# 确保 ffmpeg 在 PATH 中（whisperx.load_audio 内部调用 ffmpeg，SYSTEM 身份运行时 PATH 可能不含）
+_ffmpeg_dir = r'C:\ffmpeg\bin'
+if os.path.isdir(_ffmpeg_dir) and _ffmpeg_dir not in os.environ.get('PATH', ''):
+    os.environ['PATH'] = _ffmpeg_dir + os.pathsep + os.environ.get('PATH', '')
 
 # ============================================================================
 # 日志收集器：重定向 stdout，同时写原始终端 + 日志文件 + 内存环形缓冲区
@@ -175,7 +179,10 @@ class WorkerManager:
 
     def set_threads(self, n):
         """动态调整线程数：增加时启动新线程，减少时优雅停止多余线程"""
-        n = max(1, min(16, int(n)))
+        # GPU 模式上限 3（16GB 显存跑 WhisperX large-v3 + Demucs，超过 3 必 OOM）
+        cap = (self.capability or '').lower()
+        max_threads = 3 if cap == 'gpu' else 8
+        n = max(1, min(max_threads, int(n)))
         with self.lock:
             if not self.running:
                 self.initial_threads = n
@@ -1233,11 +1240,21 @@ def main():
     print(f'日志文件: {log_collector.log_path}')
     print(f'=' * 60)
 
+    import socket as _sock
+    _probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM); _probe.settimeout(0.5)
+    try:
+        _port_busy = _probe.connect_ex(('127.0.0.1', int(a.port))) == 0
+    finally:
+        _probe.close()
+    if _port_busy:
+        print('[Station] 端口 %s 已有一个工作站在运行，为避免多实例抢同一块 GPU 导致 OOM，本次启动退出。' % a.port)
+        sys.exit(0)
     if a.autostart:
         manager.start()
 
     # 启动 HTTP 服务器
     # 多线程 HTTP 服务器，避免浏览器多标签轮询时单线程阻塞
+    ThreadingHTTPServer.allow_reuse_address = False  # Windows 下禁止重复绑定同一端口
     server = ThreadingHTTPServer((a.host, a.port), StationHandler)
     server.daemon_threads = True
     print(f'Web 控制面板已启动: http://localhost:{a.port}')
