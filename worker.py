@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 墨墨爱K歌 —— AI 分离/对齐 Worker（跑在带 N 卡的 Windows 工作站，例如 4070TiS）
 ==============================================================================
@@ -45,6 +45,191 @@ def _pick_exe(name, fallback):
 FFMPEG = _pick_exe('ffmpeg', r'C:\ffmpeg\bin\ffmpeg.exe')
 FFPROBE = _pick_exe('ffprobe', r'C:\ffmpeg\bin\ffprobe.exe')
 
+# ---------- Demucs 模型常驻引擎（避免每首歌冷启动加载模型 ~130s） ----------
+class DemucsEngine:
+    """进程内单例：htdemucs 模型只加载一次，多首歌复用。
+    多线程（W1/W2）通过同一把锁串行调用 demucs 推理，避免并发显存翻倍。"""
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._loaded = False
+        return cls._instance
+
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+        import torch
+        _orig = torch.load
+        def _safe(*a, **kw):
+            kw['weights_only'] = False
+            return _orig(*a, **kw)
+        torch.load = _safe
+        log('[DemucsEngine] 首次分离，加载 htdemucs 模型（约 2 分钟，仅一次）...')
+        from demucs.pretrained import get_model
+        self._torch = torch
+        self._get_model = get_model
+        self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self._model = get_model('htdemucs')
+        self._model.to(self._device)
+        self._model.eval()
+        self._loaded = True
+        log(f'[DemucsEngine] 模型就绪，device={self._device}')
+
+    def separate(self, src_path, vocals_wav, accomp_wav, progress_cb=None):
+        """分离一首：src_path -> vocals.wav + accompaniment.wav（44.1kHz stereo pcm_s16le）"""
+        with self._lock:
+            self._ensure_loaded()
+            import torchaudio
+            from demucs.apply import apply_model
+            torch = self._torch
+            if progress_cb: progress_cb(15)
+            wav, sr = torchaudio.load(src_path)
+            if sr != 44100:
+                wav = torchaudio.functional.resample(wav, sr, 44100)
+            if wav.shape[0] == 1:
+                wav = torch.cat([wav, wav], dim=0)
+            elif wav.shape[0] > 2:
+                wav = wav[:2]
+            wav = wav.unsqueeze(0).to(self._device)
+            if progress_cb: progress_cb(30)
+            with torch.no_grad():
+                # 与 sep_once.py CLI 参数对齐：segment=7, overlap=0.25
+                # 之前 overlap=0.1 太低，分块拼接处产生白噪音，导致伴奏变噪音、人声被吃掉
+                out = apply_model(self._model, wav, split=True, overlap=0.25,
+                                  segment=7.0, device=self._device)
+            vocals = out[0, 3].float().cpu()
+            accomp = (out[0, 0] + out[0, 1] + out[0, 2]).float().cpu()
+            del out, wav
+            import gc; gc.collect()
+            torch.cuda.empty_cache()
+            if progress_cb: progress_cb(85)
+            os.makedirs(os.path.dirname(vocals_wav) or '.', exist_ok=True)
+            torchaudio.save(vocals_wav, vocals, 44100)
+            torchaudio.save(accomp_wav, accomp, 44100)
+            if progress_cb: progress_cb(100)
+
+DEMUCS_ENGINE = DemucsEngine()
+
+# ---------- WhisperX 模型常驻引擎（避免每首 align 子进程冷启动加载 large-v3 ~15s） ----------
+class WhisperEngine:
+    """进程内单例：whisperx large-v3 + 中文对齐模型只加载一次，多首复用。
+    和 DemucsEngine 各一把锁，W1/W2 可一个跑分离一个跑对齐，互不阻塞。"""
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._loaded = False
+        return cls._instance
+
+    def _ensure_loaded(self, model_name='large-v3'):
+        if self._loaded:
+            return
+        import torch
+        _orig = torch.load
+        def _safe(*a, **kw):
+            kw['weights_only'] = False
+            return _orig(*a, **kw)
+        torch.load = _safe
+        log('[WhisperEngine] 首次对齐，加载 whisperx large-v3 + 中文对齐模型...')
+        import whisperx
+        self._torch = torch
+        self._whisperx = whisperx
+        self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self._model = whisperx.load_model(model_name, self._device, compute_type='float16' if self._device=='cuda' else 'int8', language='zh')
+        self._model_a, self._meta = whisperx.load_align_model(language_code='zh', device=self._device)
+        self._whisper_batch = int(os.environ.get('MOMO_BATCH_SIZE', '8') or '8')
+        self._loaded = True
+        log(f'[WhisperEngine] 模型就绪, device={self._device}, batch={self._whisper_batch}')
+
+    def _vad_speech_ratio(self, audio, torch):
+        """用 whisperx 内置的 pyannote VAD 快速检测音频中人声占总时长的百分比。
+        返回 0-100 的浮点数；任何异常返回 None（调用方应降级为正常 transcribe）。
+        安全设计：VAD 失败时绝不误判纯音乐。"""
+        try:
+            vad_pipeline = getattr(self._model, 'vad_model', None)
+            if vad_pipeline is None:
+                return None
+            from whisperx.vad import merge_chunks
+            sr = 16000
+            wav_tensor = torch.from_numpy(audio).unsqueeze(0).float()
+            vad_scores = vad_pipeline({"waveform": wav_tensor, "sample_rate": sr})
+            vad_segments = merge_chunks(vad_scores, 30, onset=0.5, offset=0.363)
+            total_dur = len(audio) / float(sr)
+            if total_dur <= 0:
+                return None
+            speech_dur = sum(float(s['end']) - float(s['start']) for s in vad_segments)
+            return speech_dur / total_dur * 100.0
+        except Exception:
+            return None
+
+    def align(self, audio_path, ref_text='', model_name='large-v3', progress_cb=None):
+        """对齐一首，返回增强 LRC 文本。失败抛异常。"""
+        with self._lock:
+            self._ensure_loaded(model_name)
+            whisperx = self._whisperx
+            torch = self._torch
+            if progress_cb: progress_cb(5)
+            audio = whisperx.load_audio(audio_path)
+            if progress_cb: progress_cb(20)
+            # --- VAD 预检测：快速判断纯音乐，跳过昂贵的 ASR transcribe ---
+            try:
+                vad_ratio = self._vad_speech_ratio(audio, torch)
+                if vad_ratio is not None and vad_ratio < 5.0:
+                    log('[VAD] 人声占比=%.1f%% (<5%%)，跳过 transcribe，判定为纯音乐' % vad_ratio)
+                    raise RuntimeError('对齐后没有得到任何歌词行')
+                if vad_ratio is not None:
+                    log('[VAD] 人声占比=%.1f%%，继续 transcribe' % vad_ratio)
+            except RuntimeError:
+                raise
+            except Exception as e:
+                log('[VAD] 预检测异常(降级继续 transcribe):', repr(e))
+            # --- VAD 预检测结束 ---
+            result = self._model.transcribe(audio, batch_size=self._whisper_batch, language='zh', num_workers=0)
+            if progress_cb: progress_cb(55)
+            aligned = whisperx.align(result['segments'], self._model_a, self._meta, audio, self._device,
+                                    return_char_alignments=False)
+            if progress_cb: progress_cb(85)
+            # 官方歌词纠错
+            lrc = ''
+            if ref_text and ref_text.strip():
+                try:
+                    from lyric_matcher import correct_with_reference
+                    all_words = [w for seg in aligned.get('segments', []) for w in (seg.get('words') or [])]
+                    corr, info = correct_with_reference(all_words, ref_text)
+                    log(f'官方歌词校正: 匹配率={info.get("score")} ({info.get("matched")}/{info.get("total")})')
+                    if corr and info.get('score', 0) >= 0.25:
+                        lrc = _build_corrected_lrc_text(corr)
+                    else:
+                        log('匹配率过低，回退纯 WhisperX 结果')
+                except Exception as e:
+                    log('官方歌词校正异常(回退):', repr(e))
+            if not lrc.strip():
+                lrc = _build_enhanced_lrc_text(aligned)
+            if not lrc.strip():
+                raise RuntimeError('对齐后没有得到任何歌词行')
+            if progress_cb: progress_cb(100)
+            return lrc
+
+# 从 align_once.py 复用 LRC 生成函数（避免重复维护）
+def _build_enhanced_lrc_text(aligned):
+    import align_once as _ao
+    return _ao.build_enhanced_lrc(aligned)
+
+def _build_corrected_lrc_text(out_lines):
+    import align_once as _ao
+    return _ao.build_corrected_lrc(out_lines)
+
+WHISPER_ENGINE = WhisperEngine()
+
 # ---------- 纯音乐/轻音乐/无人声 检测规则 ----------
 # 匹配乐器名、纯音乐关键词、演奏曲等；命中则视为无人声，跳过人声分离和歌词对齐
 INSTRUMENTAL_RE = re.compile(
@@ -88,6 +273,22 @@ def is_instrumental_song(song):
         # 目前关键词已足够精确，命中即视为纯音乐
         return True
     return False
+
+# 无意义歌词判定：对齐后歌词如果只剩这些拟声词，判纯音乐
+NONSENSE_LYRIC_RE = re.compile(r'[嗯啊哦诶唉呜呃呀哟啦哼哈嘿呵哎~～\s🎵♪♫♬\[\]\(\)<>0-9:.\-]')
+
+def is_nonsense_lrc(lrc_text):
+    if not lrc_text or not lrc_text.strip(): return True
+    lines = re.sub(r'\[\d+:\d+\.\d+\]', '', lrc_text)
+    real = NONSENSE_LYRIC_RE.sub('', lines)
+    return len(real.strip()) < 3
+
+def detect_vocal_db(path):
+    try:
+        r = subprocess.run(['ffmpeg','-i',path,'-af','volumedetect','-f','null','-'],capture_output=True,text=True,timeout=15)
+        m = re.search(r'mean_volume:\s*(-?[\d.]+)\s*dB', r.stderr)
+        return float(m.group(1)) if m else None
+    except: return None
 
 def log(*a):
     tname = threading.current_thread().name
@@ -276,7 +477,9 @@ class MomoWorker:
                     log(f'检测到纯音乐/轻音乐，跳过人声分离: 《{song.get("title")}》- {song.get("artist")}')
                     self._make_instrumental_separate(src, vocals, accomp)
                 else:
-                    self.run_child('sep_once.py', [src, vocals, accomp], job_id, None)
+                    DEMUCS_ENGINE.separate(src, vocals, accomp,
+                        progress_cb=lambda p: (self.progress(job_id, p),
+                                              self.current_job.update(progress=p) if self.current_job else None))
                 files = {'vocals': ('vocals.wav', open(vocals, 'rb'), 'audio/wav'),
                          'accompaniment': ('accompaniment.wav', open(accomp, 'rb'), 'audio/wav')}
             else:
@@ -288,23 +491,39 @@ class MomoWorker:
                 else:
                     # 对齐优先用分离出的纯人声（更准）；没有就用源音频
                     vocal_src = self._separated_vocal(job['songId'], tmp) or src
-                    args = [vocal_src, word]
-                    # 官方参考歌词：优先用任务下发的；为空则当场向服务端要一次（本地同名lrc优先，
-                    # 缺则在线网易云/QQ/酷我三源补抓并入库），尽量让每首都能"官方文字+精准时间"
-                    ref = (song or {}).get('refLyrics') or ''
-                    if not ref.strip():
-                        ref = self.fetch_ref_lyrics(song['id'])
+                    # 对齐前检测人声音量：太轻说明没有人声，直接判纯音乐
+                    vdb = detect_vocal_db(vocal_src)
+                    if vdb is not None and vdb < -45:
+                        log(f'人声音量过低({vdb}dB)，判纯音乐: 《{song.get("title")}》')
+                        self._make_instrumental_align(word)
+                    else:
+                        args = [vocal_src, word]
+                        # 官方参考歌词：优先用任务下发的；为空则当场向服务端要一次（本地同名lrc优先，
+                        # 缺则在线网易云/QQ/酷我三源补抓并入库），尽量让每首都能"官方文字+精准时间"
+                        ref = (song or {}).get('refLyrics') or ''
+                        if not ref.strip():
+                            ref = self.fetch_ref_lyrics(song['id'])
+                            if ref.strip():
+                                log(f'补到官方参考歌词 {len(ref)} 字符（本地/在线）')
+                        # 官方参考歌词（本地同名lrc/三源刮削已入库）：传给对齐子进程做逐字纠错
                         if ref.strip():
-                            log(f'补到官方参考歌词 {len(ref)} 字符（本地/在线）')
-                    # 官方参考歌词（本地同名lrc/三源刮削已入库）：传给对齐子进程做逐字纠错
-                    if ref.strip():
-                        ref_path = os.path.join(tmp, 'ref.lrc')
-                        with open(ref_path, 'w', encoding='utf-8') as f:
-                            f.write(ref)
-                        args.append('large-v3')   # 第3位是模型名，第4位才是参考歌词路径
-                        args.append(ref_path)
-                        log(f'附带官方参考歌词 {len(ref)} 字符用于纠错')
-                    self.run_child('align_once.py', args, job_id, None)
+                            ref_path = os.path.join(tmp, 'ref.lrc')
+                            with open(ref_path, 'w', encoding='utf-8') as f:
+                                f.write(ref)
+                            args.append('large-v3')   # 第3位是模型名，第4位才是参考歌词路径
+                            args.append(ref_path)
+                            log(f'附带官方参考歌词 {len(ref)} 字符用于纠错')
+                        lrc_text = WHISPER_ENGINE.align(vocal_src, ref_text=ref,
+                            progress_cb=lambda p: (self.progress(job_id, p),
+                                                  self.current_job.update(progress=p) if self.current_job else None))
+                        # 校验：如果歌词只是"嗯嗯嗯/🎵"等无意义内容，判定为纯音乐
+                        if is_nonsense_lrc(lrc_text):
+                            log(f'歌词无意义(只剩拟声词)，判定为纯音乐: 《{song.get("title")}》')
+                            self._make_instrumental_align(word)
+                        else:
+                            with open(word, 'w', encoding='utf-8') as f:
+                                f.write(lrc_text)
+                            log(f'逐字歌词 {lrc_text.count(chr(10))} 行 -> {os.path.basename(word)}')
                 files = {'wordLrc': ('word.lrc', open(word, 'rb'), 'text/plain')}
             try:
                 self.progress(job_id, 95)

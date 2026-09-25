@@ -10,7 +10,7 @@ echo   按 Ctrl+C 停止服务
 echo ============================================================
 echo.
 
-".venv\Scripts\python.exe" station.py --port 8765 --server http://192.168.3.16:8083 --worker pc-51 --mode both --capability gpu --threads 2 --autostart
+".venv\Scripts\python.exe" station.py --port 8765 --server http://192.168.3.16:8083 --worker pc-51 --mode both --capability gpu --threads 3 --autostart
 
 echo.
 echo ============================================================

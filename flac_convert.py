@@ -26,6 +26,10 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 
 DEFAULT_ROOT = r'\\192.168.3.80\music'
+# Global SMB credentials for reconnection in worker processes
+_SMB_SHARE = r'\\192.168.3.80\music'
+_SMB_USER = ''
+_SMB_PASS = ''
 def _pick(exe, fallback):
     p = shutil.which(exe)
     if p and os.path.exists(p):
@@ -678,6 +682,9 @@ def pick_whole(job, cue_name):
 def process_album(args):
     dp, job, root, out_root, do_exec = args
     r = {'dir': dp, 'ok': 0, 'skip': 0, 'fail': [], 'tracks': 0, 'note': ''}
+    # Ensure SMB connection is alive (worker processes may lose it)
+    if _SMB_USER and _SMB_PASS:
+        ensure_share(_SMB_SHARE, _SMB_USER, _SMB_PASS)
     if not job['cues']:
         r['note'] = 'NO_CUE'
         return r
@@ -887,6 +894,11 @@ def main():
         args.out_root = os.path.join(args.root, 'all-flacs')
 
     ensure_share(args.smb_share, args.smb_user, args.smb_pass)
+    # Set global SMB credentials for worker process reconnection
+    global _SMB_SHARE, _SMB_USER, _SMB_PASS
+    _SMB_SHARE = args.smb_share
+    _SMB_USER = args.smb_user
+    _SMB_PASS = args.smb_pass
     log('ROOT=', args.root, ' 存在=', os.path.exists(args.root))
     log('OUT =', args.out_root, ' ffmpeg=', FFMPEG)
 
