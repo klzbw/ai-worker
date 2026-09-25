@@ -296,6 +296,11 @@ def log(*a):
     print(time.strftime('%H:%M:%S'), prefix, *a, flush=True)
 
 class MomoWorker:
+    # 类级下载锁：多线程并发下载115网盘音频容易触发403限流，
+    # 同一时间只允许一个worker执行音频下载（含.strm跟随），避免并发打爆源站。
+    # 修复：端到端测试问题1——115网盘间歇性403。
+    _download_lock = threading.Lock()
+
     def __init__(self, server, worker, mode, python_exe, capability=None):
         self.server = server.rstrip('/')
         self.worker = worker
@@ -347,11 +352,16 @@ class MomoWorker:
             pass
 
     # 下载源音频，返回本地路径（从 Content-Disposition 解析真实扩展名，Demucs 靠后缀识别格式）
+    # 修复问题1：全局下载锁串行化下载，避免多线程并发触发115限流403。
     def download(self, task, base_path):
         url = task['sourceUrl']
         if url.startswith('/'):
             url = self.server + url
         log('下载源音频:', url)
+        with self._download_lock:
+            return self._download_unlocked(task, base_path, url)
+
+    def _download_unlocked(self, task, base_path, url):
         with self.s.get(url, stream=True, timeout=300) as r:
             r.raise_for_status()
             ext = ''
@@ -390,7 +400,10 @@ class MomoWorker:
         return None
 
     # 跟随 .strm 里的 URL 下载真实音频，替换文本指针文件，返回真实音频本地路径。
-    # 115 CDN 偶发 403/限流，最多重试 2 次（指数退避）。
+    # 修复问题1：115 CDN 偶发 403/限流，重试从2次增至5次，退避从固定3/6s改为指数5/10/20/40/60s。
+    # 调用方（_download_unlocked）已持有 _download_lock，此处不再重复加锁。
+    _STRM_RETRY_BACKOFF = (5, 10, 20, 40, 60)  # 5次重试的等待秒数（指数退避）
+
     def _fetch_strm_target(self, url, text_dst):
         path_part = urllib.parse.urlparse(url).path
         ext = os.path.splitext(path_part)[1].lower()
@@ -398,7 +411,8 @@ class MomoWorker:
             ext = '.flac'
         real_dst = os.path.splitext(text_dst)[0] + ext
         last_exc = None
-        for attempt in range(3):
+        max_attempts = 1 + len(self._STRM_RETRY_BACKOFF)  # 1次首次 + 5次重试 = 6次
+        for attempt in range(max_attempts):
             try:
                 with self.s.get(url, stream=True, timeout=600) as r:
                     if r.status_code in (403, 429, 500, 502, 503, 504):
@@ -411,9 +425,9 @@ class MomoWorker:
                 break
             except Exception as e:
                 last_exc = e
-                if attempt < 2:
-                    wait = 3 * (attempt + 1)
-                    log(f'.strm 下载第{attempt+1}次失败({e})，{wait}s后重试...')
+                if attempt < len(self._STRM_RETRY_BACKOFF):
+                    wait = self._STRM_RETRY_BACKOFF[attempt]
+                    log(f'.strm 下载第{attempt+1}次失败({e})，{wait}s后重试（共{len(self._STRM_RETRY_BACKOFF)}次重试）...')
                     time.sleep(wait)
         if last_exc:
             raise last_exc

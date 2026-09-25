@@ -1820,6 +1820,23 @@ function browserConfirm(){
 def main():
     global manager, log_collector, convert_manager
 
+    # 修复问题3：单实例检测前移到 main() 最开头，在任何重初始化（import worker/创建manager/起线程）
+    # 之前就抢占端口。原代码在创建WorkerManager之后才检测，两个进程同时启动时都能通过检测，
+    # 导致系统Python和venv Python各起一个station，抢同一块GPU导致OOM和任务重复领取。
+    import socket as _sock_pre
+    _pre_parser = argparse.ArgumentParser(add_help=False)
+    _pre_parser.add_argument('--port', type=int, default=8765)
+    _pre_args, _ = _pre_parser.parse_known_args()
+    _probe = _sock_pre.socket(_sock_pre.AF_INET, _sock_pre.SOCK_STREAM)
+    _probe.settimeout(0.5)
+    try:
+        _port_busy = _probe.connect_ex(('127.0.0.1', int(_pre_args.port))) == 0
+    finally:
+        _probe.close()
+    if _port_busy:
+        print('[Station] 端口 %s 已有一个工作站在运行，为避免多实例抢GPU导致OOM，本次启动退出。' % _pre_args.port)
+        sys.exit(0)
+
     cfg = load_config()
 
     ap = argparse.ArgumentParser(description='墨墨爱K歌 AI 分离工作站（可视化控制面板）')
@@ -1878,22 +1895,21 @@ def main():
     print(f'日志文件: {log_collector.log_path}')
     print(f'=' * 60)
 
-    import socket as _sock
-    _probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM); _probe.settimeout(0.5)
-    try:
-        _port_busy = _probe.connect_ex(('127.0.0.1', int(a.port))) == 0
-    finally:
-        _probe.close()
-    if _port_busy:
-        print('[Station] 端口 %s 已有一个工作站在运行，为避免多实例抢同一块 GPU 导致 OOM，本次启动退出。' % a.port)
-        sys.exit(0)
+    # 修复问题2：autostart 启动日志，便于排查"线程数为0"问题
     if a.autostart:
+        print('[Station] --autostart 已设置，自动启动 %d 个 Worker 线程...' % init_threads)
         manager.start()
+        print('[Station] Worker 自动启动完成，当前线程数: %d' % manager.get_status()['thread_count'])
 
     # 启动 HTTP 服务器
     # 多线程 HTTP 服务器，避免浏览器多标签轮询时单线程阻塞
     ThreadingHTTPServer.allow_reuse_address = False  # Windows 下禁止重复绑定同一端口
-    server = ThreadingHTTPServer((a.host, a.port), StationHandler)
+    try:
+        server = ThreadingHTTPServer((a.host, a.port), StationHandler)
+    except OSError as _e:
+        print('[Station] 端口 %s 绑定失败: %s（可能另一个进程刚抢占），停止Worker并退出。' % (a.port, _e))
+        manager.stop()
+        sys.exit(1)
     server.daemon_threads = True
     print(f'Web 控制面板已启动: http://localhost:{a.port}')
     print(f'局域网访问: http://<本机IP>:{a.port}')
