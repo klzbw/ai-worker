@@ -20,12 +20,14 @@ station.py —— 墨墨爱K歌 AI 分离工作站（可视化控制面板）
   - 线程增减通过 MomoWorker.stop_event 优雅退出：减线程时被撤的线程跑完当前歌曲即退出，不中断任务
 """
 import argparse, os, sys, time, json, threading, subprocess, re, io
+import requests
+import urllib.parse
 from collections import deque
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # 让 worker.py 能被 import（同目录）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from worker import MomoWorker, load_config
+from worker import MomoWorker, load_config, DEMUCS_ENGINE, WHISPER_ENGINE
 
 # Windows GBK控制台强制UTF-8
 if hasattr(sys.stdout, 'reconfigure'):
@@ -395,10 +397,168 @@ class ConvertManager:
 
 
 # ============================================================================
+# ManualTaskManager —— 自定义文件手动处理（不经数据库，本机直接调引擎）
+# ============================================================================
+class ManualTaskManager:
+    """管理"自定义文件处理"后台线程：直接调 DEMUCS_ENGINE / WHISPER_ENGINE。
+    与自动模式共用 GPU（引擎内部已有锁串行化），产物保存到用户指定目录。"""
+    def __init__(self):
+        self.thread = None
+        self.running = False
+        self.stop_event = threading.Event()
+        self.start_time = None
+        self.stats = {
+            'output_dir': '', 'task': '',
+            'current_step': '', 'progress': 0,
+            'current_file': '', 'total_files': 0, 'done_files': 0,
+            'output_files': [], 'error': '',
+        }
+
+    def start(self, input_paths_text, output_dir, task='both', upload_back=False):
+        if self.running:
+            return False, '手动处理已在运行中，请先停止'
+        self.stop_event.clear()
+        # 拆分多文件：换行或逗号分隔
+        paths = [p.strip() for p in re.split(r'[\n,，]+', input_paths_text) if p.strip()]
+        if not paths:
+            return False, '未解析到任何文件路径'
+        self.stats = {
+            'output_dir': output_dir, 'task': task,
+            'current_step': '排队中', 'progress': 0,
+            'current_file': '', 'total_files': len(paths), 'done_files': 0,
+            'output_files': [], 'error': '',
+        }
+        self.running = True
+        self.start_time = time.time()
+        self.thread = threading.Thread(
+            target=self._run, args=(paths, output_dir, task, upload_back),
+            name='ManualProc', daemon=True)
+        self.thread.start()
+        return True, f'已受理 {len(paths)} 个文件，后台处理中（日志见下方实时日志面板）'
+
+    def stop(self):
+        if not self.running:
+            return False, '没有正在运行的手动任务'
+        self.stop_event.set()
+        print('[Manual] 收到停止请求，当前推理步骤完成后退出...', flush=True)
+        return True, '停止请求已发送（当前推理步骤完成后停止）'
+
+    def get_status(self):
+        s = {'running': self.running, **self.stats}
+        s['elapsed'] = int(time.time() - self.start_time) if (self.start_time and self.running) else 0
+        return s
+
+    def _run_one(self, src, output_dir, stem, task, upload_back, file_idx, total):
+        """处理单个文件，返回该文件产生的输出文件列表。"""
+        output_files = []
+        # 人声分离
+        need_sep = task in ('separate', 'both')
+        vocals_path = os.path.join(output_dir, f'{stem}-vocals.wav')
+        accomp_path = os.path.join(output_dir, f'{stem}-accompaniment.wav')
+        if need_sep:
+            if self.stop_event.is_set():
+                raise RuntimeError('已被用户停止')
+            print(f'[Manual] ({file_idx}/{total}) 开始 Demucs 人声分离（首次加载模型约2分钟）...', flush=True)
+            self.stats['current_step'] = '人声分离中'
+
+            def _sep_cb(p, _idx=file_idx, _tot=total):
+                self.stats['progress'] = int(((_idx - 1) + p / 100.0) / _tot * 100)
+                self.stats['current_step'] = f'第 {_idx}/{_tot} 个 · 分离 {p}%'
+
+            DEMUCS_ENGINE.separate(src, vocals_path, accomp_path, progress_cb=_sep_cb)
+            output_files.append(vocals_path)
+            output_files.append(accomp_path)
+            print(f'[Manual] ({file_idx}/{total}) 分离完成: {os.path.basename(vocals_path)}', flush=True)
+
+        # 逐字对齐
+        need_align = task in ('align', 'both')
+        if need_align:
+            if self.stop_event.is_set():
+                raise RuntimeError('已被用户停止')
+            align_src = vocals_path if (need_sep and os.path.exists(vocals_path)) else src
+            print(f'[Manual] ({file_idx}/{total}) 开始 WhisperX 逐字对齐 (源: {os.path.basename(align_src)})...', flush=True)
+            self.stats['current_step'] = '逐字对齐中'
+
+            def _align_cb(p, _idx=file_idx, _tot=total, _need_sep=need_sep):
+                if _need_sep:
+                    self.stats['progress'] = int(((_idx - 1) + 0.5 + p / 200.0) / _tot * 100)
+                else:
+                    self.stats['progress'] = int(((_idx - 1) + p / 100.0) / _tot * 100)
+                self.stats['current_step'] = f'第 {_idx}/{_tot} 个 · 对齐 {p}%'
+
+            lrc_text = WHISPER_ENGINE.align(align_src, ref_text='', progress_cb=_align_cb)
+            lrc_path = os.path.join(output_dir, f'{stem}.lrc')
+            with open(lrc_path, 'w', encoding='utf-8') as f:
+                f.write(lrc_text)
+            output_files.append(lrc_path)
+            print(f'[Manual] ({file_idx}/{total}) 对齐完成: {os.path.basename(lrc_path)} ({lrc_text.count(chr(10))} 行)', flush=True)
+        return output_files
+
+    def _run(self, paths, output_dir, task, upload_back):
+        import tempfile, shutil, urllib.parse
+        total = len(paths)
+        all_output_files = []
+        tmp_dirs = []
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            print(f'[Manual] 共 {total} 个文件待处理，输出目录: {output_dir}，任务: {task}', flush=True)
+
+            for idx, item in enumerate(paths, start=1):
+                if self.stop_event.is_set():
+                    raise RuntimeError('已被用户停止')
+                self.stats['current_file'] = item
+                self.stats['current_step'] = f'第 {idx}/{total} 个'
+                print(f'[Manual] ── ({idx}/{total}) {item}', flush=True)
+
+                src = item
+                tmp_dir = None
+                if item.startswith('http://') or item.startswith('https://'):
+                    print(f'[Manual] 下载网络音频: {item}', flush=True)
+                    self.stats['current_step'] = f'第 {idx}/{total} 个 · 下载中'
+                    tmp_dir = tempfile.mkdtemp(prefix='momo_manual_')
+                    tmp_dirs.append(tmp_dir)
+                    parsed = urllib.parse.urlparse(item)
+                    ext = os.path.splitext(parsed.path)[1] or '.mp3'
+                    src = os.path.join(tmp_dir, 'source' + ext)
+                    with requests.get(item, stream=True, timeout=600) as r:
+                        r.raise_for_status()
+                        with open(src, 'wb') as f:
+                            for chunk in r.iter_content(1 << 20):
+                                f.write(chunk)
+                    print(f'[Manual] 下载完成: {os.path.getsize(src)//1024} KB', flush=True)
+                else:
+                    if not os.path.exists(item):
+                        raise FileNotFoundError(f'文件不存在: {item}')
+
+                stem = os.path.splitext(os.path.basename(src))[0]
+                files = self._run_one(src, output_dir, stem, task, upload_back, idx, total)
+                all_output_files.extend(files)
+                self.stats['done_files'] = idx
+                self.stats['output_files'] = all_output_files
+
+            if upload_back:
+                print('[Manual] 提示: upload_back=true，但自定义文件处理无对应歌曲ID，跳过回传', flush=True)
+
+            self.stats['progress'] = 100
+            self.stats['current_step'] = '全部完成'
+            print(f'[Manual] ✅ 全部完成，共处理 {total} 个文件，输出 {len(all_output_files)} 个文件', flush=True)
+
+        except Exception as e:
+            self.stats['error'] = str(e)
+            self.stats['current_step'] = '失败'
+            print(f'[Manual] ❌ 失败: {e}', flush=True)
+        finally:
+            self.running = False
+            for d in tmp_dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+
+# ============================================================================
 # 全局单例
 # ============================================================================
 manager = None
 convert_manager = None
+manual_manager = None
 log_collector = None
 
 
@@ -458,6 +618,32 @@ class StationHandler(BaseHTTPRequestHandler):
                     except: pass
             lines = convert_manager.get_logs(since) if convert_manager else []
             self._send_json({'lines': lines, 'latest_id': convert_manager.log_id if convert_manager else 0})
+        elif path == '/api/manual/status':
+            self._send_json(manual_manager.get_status() if manual_manager else {'running': False})
+        elif path == '/api/browse':
+            # 目录浏览 API：返回指定目录下的子目录和音频文件
+            qs = self.path.split('?')[1] if '?' in self.path else ''
+            browse_path = ''
+            for kv in qs.split('&'):
+                if kv.startswith('path='):
+                    browse_path = urllib.parse.unquote(kv[5:])
+            self._send_json(self._list_dir(browse_path))
+        elif path == '/api/ktv/no-lyrics':
+            # 从 momo-ktv 服务端获取无逐字歌词的音频歌曲列表（预览/勾选用）
+            qs = self.path.split('?')[1] if '?' in self.path else ''
+            limit = 100
+            for kv in qs.split('&'):
+                if kv.startswith('limit='):
+                    try:
+                        limit = max(1, min(500, int(kv[6:])))
+                    except Exception:
+                        pass
+            try:
+                r = requests.get(f'{manager.server}/api/songs/no-lyrics',
+                                 params={'limit': limit}, timeout=15)
+                self._send_json(r.json())
+            except Exception as e:
+                self._send_json({'ok': False, 'error': str(e)}, 500)
         else:
             self._send_json({'error': 'not found'}, 404)
 
@@ -486,8 +672,75 @@ class StationHandler(BaseHTTPRequestHandler):
         elif path == '/api/convert/stop':
             ok, msg = convert_manager.stop()
             self._send_json({'ok': ok, 'msg': msg})
+        elif path == '/api/manual/enqueue':
+            # 代理到服务端的 /api/separate/enqueue
+            song_ids = data.get('song_ids', [])
+            job_type = data.get('type', 'separate')
+            force = data.get('force', False)
+            try:
+                r = requests.post(f'{manager.server}/api/separate/enqueue',
+                                  json={'song_ids': song_ids, 'type': job_type, 'force': force}, timeout=30)
+                self._send_json(r.json())
+            except Exception as e:
+                self._send_json({'ok': False, 'error': str(e)}, 500)
+        elif path == '/api/manual/upload-lyrics':
+            # 代理到服务端的 /api/cloud-lyrics/upload
+            song_ids = data.get('song_ids', [])
+            try:
+                r = requests.post(f'{manager.server}/api/cloud-lyrics/upload',
+                                  json={'song_ids': song_ids}, timeout=30)
+                self._send_json(r.json())
+            except Exception as e:
+                self._send_json({'ok': False, 'error': str(e)}, 500)
+        elif path == '/api/manual/process-file':
+            input_paths = data.get('input_path', '').strip()
+            output_dir = data.get('output_dir', '').strip()
+            task = data.get('task', 'both')
+            upload_back = bool(data.get('upload_back', False))
+            if not input_paths or not output_dir:
+                self._send_json({'ok': False, 'error': 'input_path 和 output_dir 不能为空'}, 400)
+                return
+            ok, msg = manual_manager.start(input_paths, output_dir, task, upload_back)
+            self._send_json({'ok': ok, 'msg': msg})
+        elif path == '/api/manual/stop':
+            ok, msg = manual_manager.stop()
+            self._send_json({'ok': ok, 'msg': msg})
         else:
             self._send_json({'error': 'not found'}, 404)
+
+    def _list_dir(self, dir_path):
+        """目录浏览：返回子目录和音频文件列表"""
+        import string as _string
+        audio_exts = {'.flac','.wav','.mp3','.m4a','.ape','.ogg','.aac','.wma','.dsf','.dff','.strm'}
+        try:
+            if not dir_path or dir_path == '/':
+                drives = []
+                for c in _string.ascii_uppercase:
+                    d = c + ':\\'
+                    if os.path.exists(d):
+                        drives.append({'name': d, 'path': d, 'type': 'drive'})
+                return {'path': '', 'parent': '', 'dirs': drives, 'files': []}
+            dir_path = os.path.normpath(dir_path)
+            if not os.path.isdir(dir_path):
+                return {'path': dir_path, 'parent': '', 'dirs': [], 'files': [], 'error': '目录不存在'}
+            parent = os.path.dirname(dir_path)
+            dirs = []
+            files = []
+            for name in sorted(os.listdir(dir_path)):
+                full = os.path.join(dir_path, name)
+                try:
+                    if os.path.isdir(full):
+                        dirs.append({'name': name, 'path': full, 'type': 'dir'})
+                    else:
+                        ext = os.path.splitext(name)[1].lower()
+                        if ext in audio_exts:
+                            size = os.path.getsize(full)
+                            files.append({'name': name, 'path': full, 'type': 'file', 'size': size})
+                except Exception:
+                    pass
+            return {'path': dir_path, 'parent': parent, 'dirs': dirs, 'files': files}
+        except Exception as e:
+            return {'path': dir_path, 'parent': '', 'dirs': [], 'files': [], 'error': str(e)}
 
     def log_message(self, *args):
         pass  # 静默 HTTP 请求日志，避免刷屏
@@ -825,6 +1078,105 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   <div class="empty"><div class="icon">📝</div>Worker 未启动，点击右上角「启动 Worker」</div>
 </div>
 
+<!-- ==================== 区域：手动批量操作 ==================== -->
+<div class="section-header" style="border-color:var(--orange)">
+  <div class="icon" style="background:linear-gradient(135deg,rgba(251,146,60,.2),rgba(248,113,113,.2));border:1px solid var(--orange)">⚡</div>
+  <h2>手动批量操作</h2>
+  <span class="desc">手动选择歌曲ID批量触发分离/对齐/上传，不影响自动模式</span>
+</div>
+<div class="panel">
+  <div class="form-grid">
+    <div class="form-item full">
+      <label>歌曲 ID 列表（逗号分隔，支持范围如 100-200，或混合：1,5,10-20,50）</label>
+      <input type="text" id="manualIds" placeholder="例如：100,200,300-350" style="font-family:Consolas,monospace">
+    </div>
+    <div class="form-item">
+      <label>任务类型</label>
+      <select id="manualType">
+        <option value="both">分离+对齐（先分离后对齐）</option>
+        <option value="separate">仅人声分离</option>
+        <option value="align">仅逐字对齐</option>
+      </select>
+    </div>
+    <div class="form-item">
+      <label>强制重做</label>
+      <select id="manualForce">
+        <option value="false">否（跳过已完成的）</option>
+        <option value="true">是（已完成的也重新排队）</option>
+      </select>
+    </div>
+  </div>
+  <div class="form-row">
+    <button class="btn btn-start" onclick="manualEnqueue()">▶ 批量入队</button>
+    <button class="btn" style="background:linear-gradient(135deg,var(--purple),#7c3aed);color:#fff" onclick="manualUploadLyrics()">☁️ 上传歌词到网盘</button>
+  </div>
+  <div id="manualResult" style="margin-top:12px;font-size:12px;color:var(--muted);line-height:1.8"></div>
+  <div style="font-size:10px;color:var(--muted);margin-top:8px;line-height:1.6">
+    💡 入队后 Worker 会自动领取处理（需 Worker 处于运行状态）。上传歌词仅对已有逐字歌词(lyrics_word)的 audio 歌曲有效，115云盘可写，移动云盘不支持写入。
+  </div>
+  <!-- 无歌词歌曲预览选择：从KTV拉取无逐字歌词的audio歌曲，勾选后批量入队/上传 -->
+  <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <button class="btn" style="background:linear-gradient(135deg,var(--teal),#0d9488);color:#fff;font-size:12px" onclick="fetchNoLyrics()">🔍 从KTV获取无歌词歌曲</button>
+      <span id="noLyricsInfo" style="font-size:12px;color:var(--muted)"></span>
+    </div>
+    <div id="noLyricsList" style="display:none;max-height:320px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg);z-index:1;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+          <input type="checkbox" id="noLyricsSelectAll" onchange="toggleSelectAllNoLyrics(this.checked)" style="accent-color:var(--teal)"> 全选
+        </label>
+        <span id="noLyricsSelected" style="font-size:12px;color:var(--teal);font-weight:bold">已选 0 首</span>
+        <div style="margin-left:auto;display:flex;gap:6px">
+          <button class="btn btn-start" style="font-size:11px;padding:4px 12px" onclick="enqueueSelectedNoLyrics()">▶ 入队所选</button>
+          <button class="btn" style="font-size:11px;padding:4px 12px;background:linear-gradient(135deg,var(--purple),#7c3aed);color:#fff" onclick="uploadSelectedNoLyrics()">☁️ 上传歌词</button>
+        </div>
+      </div>
+      <div id="noLyricsItems"></div>
+    </div>
+  </div>
+</div>
+
+<div class="sub-title" style="margin-top:18px">自定义文件处理（不经数据库，本机直接推理）</div>
+<div class="panel">
+  <div class="form-grid">
+    <div class="form-item full">
+      <label>源文件路径（本地路径或 http(s) URL，每行一个，或用逗号分隔）</label>
+      <div style="display:flex;gap:6px;align-items:flex-start">
+        <textarea id="mpInput" rows="3" placeholder="C:\\music\\song1.flac&#10;C:\\music\\song2.flac&#10;https://xxx.com/song3.flac" style="flex:1;padding:8px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;outline:none;font-family:Consolas,monospace;resize:vertical"></textarea>
+        <button class="btn" style="padding:8px 12px;white-space:nowrap;background:linear-gradient(135deg,var(--teal),#0d9488);color:#fff;font-size:12px" onclick="openBrowser('file')">📁 浏览</button>
+      </div>
+    </div>
+    <div class="form-item full">
+      <label>输出目录（产物保存到此目录）</label>
+      <div style="display:flex;gap:6px">
+        <input type="text" id="mpOutput" placeholder="例如：D:\\output\\" style="flex:1;font-family:Consolas,monospace">
+        <button class="btn" style="padding:8px 12px;white-space:nowrap;background:linear-gradient(135deg,var(--teal),#0d9488);color:#fff;font-size:12px" onclick="openBrowser('dir')">📁 浏览</button>
+      </div>
+    </div>
+    <div class="form-item">
+      <label>任务类型</label>
+      <select id="mpTask">
+        <option value="both">分离+对齐</option>
+        <option value="separate">仅人声分离</option>
+        <option value="align">仅逐字对齐</option>
+      </select>
+    </div>
+    <div class="form-item">
+      <label>回传服务端（需有对应歌曲ID，自定义文件通常无需）</label>
+      <select id="mpUploadBack">
+        <option value="false">否</option>
+        <option value="true">是</option>
+      </select>
+    </div>
+  </div>
+  <div class="form-row">
+    <button class="btn btn-start" id="mpStartBtn" onclick="manualProcessFile()">▶ 开始处理</button>
+    <button class="btn btn-stop" id="mpStopBtn" onclick="manualStopFile()" style="display:none">■ 停止</button>
+  </div>
+  <div id="mpStatus" style="margin-top:12px;font-size:12px;color:var(--muted);line-height:1.8"></div>
+  <div id="mpFiles" style="margin-top:8px;font-size:11px;color:var(--teal);line-height:1.8"></div>
+</div>
+
 <!-- ==================== 区域3：FLAC转码 ==================== -->
 <div class="section-header convert">
   <div class="icon">🎼</div>
@@ -1122,6 +1474,150 @@ async function fetchConvertLogs(){
 }
 
 // ---------- 操作 ----------
+function parseIds(input){
+  const ids = new Set();
+  String(input).split(/[,，\s]+/).forEach(part=>{
+    if(!part.trim())return;
+    const m = part.match(/^(\d+)\s*-\s*(\d+)$/);
+    if(m){
+      const a=parseInt(m[1]),b=parseInt(m[2]);
+      for(let i=Math.min(a,b);i<=Math.max(a,b);i++)ids.add(i);
+    } else {
+      const n=parseInt(part);
+      if(Number.isInteger(n))ids.add(n);
+    }
+  });
+  return [...ids];
+}
+async function manualEnqueue(){
+  const ids = parseIds(document.getElementById('manualIds').value);
+  if(ids.length===0){alert('请输入歌曲ID');return;}
+  if(!confirm(`确定将 ${ids.length} 首歌入队？`))return;
+  const type = document.getElementById('manualType').value;
+  const force = document.getElementById('manualForce').value === 'true';
+  const r = await fetch('/api/manual/enqueue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({song_ids:ids,type,force})});
+  const d = await r.json();
+  document.getElementById('manualResult').innerHTML =
+    d.ok ? `✅ 已入队 <b style="color:var(--green)">${d.added||0}</b> 个任务，跳过 <b>${d.skipped||0}</b> 个` : `❌ 失败：${esc(d.error||'')}`;
+}
+async function manualUploadLyrics(){
+  const ids = parseIds(document.getElementById('manualIds').value);
+  if(ids.length===0){alert('请输入歌曲ID');return;}
+  if(!confirm(`确定上传 ${ids.length} 首歌的歌词到网盘？`))return;
+  const r = await fetch('/api/manual/upload-lyrics',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({song_ids:ids})});
+  const d = await r.json();
+  document.getElementById('manualResult').innerHTML =
+    d.ok ? `✅ 已受理上传 <b style="color:var(--green)">${d.uploaded||0}</b> 首，跳过 <b>${d.skipped||0}</b> 首（异步执行中）` : `❌ 失败：${esc(d.error||'')}`;
+}
+// ---------- 无歌词歌曲预览选择（从KTV获取，勾选后批量入队/上传） ----------
+let noLyricsSongs = [];
+async function fetchNoLyrics(){
+  const info = document.getElementById('noLyricsInfo');
+  info.textContent = '正在从KTV获取...';
+  try{
+    const r = await fetch('/api/ktv/no-lyrics?limit=200');
+    const d = await r.json();
+    if(!d.ok){ info.textContent = '获取失败: ' + (d.error||'未知错误'); return; }
+    noLyricsSongs = d.songs || [];
+    info.textContent = '共 ' + d.total + ' 首无逐字歌词，显示 ' + d.count + ' 首（按ID倒序）';
+    renderNoLyricsList();
+  }catch(e){ info.textContent = '获取失败: ' + e.message; }
+}
+function renderNoLyricsList(){
+  const container = document.getElementById('noLyricsList');
+  const items = document.getElementById('noLyricsItems');
+  container.style.display = 'block';
+  if(noLyricsSongs.length === 0){
+    items.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">暂无无逐字歌词的音频歌曲</div>';
+    updateNoLyricsSelected();
+    return;
+  }
+  items.innerHTML = noLyricsSongs.map(function(s){
+    var ext = (s.filename || '').split('.').pop().toUpperCase();
+    var lyricTag = s.has_plain_lyrics
+      ? '<span style="font-size:10px;color:var(--teal);background:rgba(13,148,136,.15);padding:2px 6px;border-radius:4px">有纯文本歌词</span>'
+      : '<span style="font-size:10px;color:var(--orange);background:rgba(251,146,60,.15);padding:2px 6px;border-radius:4px">无歌词</span>';
+    var sepTag = (s.sep_status && s.sep_status !== 'none')
+      ? '<span style="font-size:10px;color:var(--green)">分离OK</span>' : '<span style="font-size:10px;color:var(--muted)">未分离</span>';
+    return '<label style="display:flex;align-items:center;gap:8px;padding:6px 4px;border-bottom:1px solid var(--border);cursor:pointer;font-size:12px">'
+      + '<input type="checkbox" class="no-lyrics-check" data-id="' + s.id + '" onchange="updateNoLyricsSelected()" style="accent-color:var(--teal);flex-shrink:0;width:16px;height:16px">'
+      + '<span style="color:var(--muted);font-family:Consolas,monospace;min-width:42px;flex-shrink:0">#' + s.id + '</span>'
+      + '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><b>' + esc(s.title||'未知') + '</b> <span style="color:var(--muted)">- ' + esc(s.artist||'未知') + '</span></span>'
+      + '<span style="font-size:10px;color:var(--muted);background:var(--bg2);padding:2px 6px;border-radius:4px;flex-shrink:0">' + ext + '</span>'
+      + sepTag + lyricTag
+      + '</label>';
+  }).join('');
+  document.getElementById('noLyricsSelectAll').checked = false;
+  updateNoLyricsSelected();
+}
+function toggleSelectAllNoLyrics(checked){
+  document.querySelectorAll('.no-lyrics-check').forEach(function(c){ c.checked = checked; });
+  updateNoLyricsSelected();
+}
+function updateNoLyricsSelected(){
+  var n = document.querySelectorAll('.no-lyrics-check:checked').length;
+  document.getElementById('noLyricsSelected').textContent = '已选 ' + n + ' 首';
+}
+function getSelectedNoLyricsIds(){
+  return [...document.querySelectorAll('.no-lyrics-check:checked')].map(function(c){ return parseInt(c.dataset.id); });
+}
+async function enqueueSelectedNoLyrics(){
+  var ids = getSelectedNoLyricsIds();
+  if(ids.length === 0){ alert('请先勾选歌曲'); return; }
+  // 将选中ID填入手动输入框，复用现有入队逻辑（含任务类型/强制重做设置）
+  document.getElementById('manualIds').value = ids.join(',');
+  await manualEnqueue();
+}
+async function uploadSelectedNoLyrics(){
+  var ids = getSelectedNoLyricsIds();
+  if(ids.length === 0){ alert('请先勾选歌曲'); return; }
+  document.getElementById('manualIds').value = ids.join(',');
+  await manualUploadLyrics();
+}
+async function manualProcessFile(){
+  const input = document.getElementById('mpInput').value.trim();
+  const output = document.getElementById('mpOutput').value.trim();
+  if(!input || !output){alert('请填写源文件路径和输出目录');return;}
+  const task = document.getElementById('mpTask').value;
+  const upload_back = document.getElementById('mpUploadBack').value === 'true';
+  const r = await fetch('/api/manual/process-file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input_path:input,output_dir:output,task,upload_back})});
+  const d = await r.json();
+  if(!d.ok) alert(d.msg||d.error);
+  fetchManualStatus();
+}
+async function manualStopFile(){
+  await fetch('/api/manual/stop',{method:'POST'});
+  fetchManualStatus();
+}
+async function fetchManualStatus(){
+  try{
+    const r = await fetch('/api/manual/status');
+    const d = await r.json();
+    const running = d.running;
+    document.getElementById('mpStartBtn').style.display = running?'none':'inline-flex';
+    document.getElementById('mpStopBtn').style.display = running?'inline-flex':'none';
+    const s = d.current_step||'';
+    const pct = d.progress||0;
+    const done = d.done_files||0, total = d.total_files||0;
+    let html = '';
+    if(running){
+      html = `📊 总体进度 <b style="color:var(--accent)">${pct}%</b>（${done}/${total}）<br>`;
+      if(d.current_file) html += `当前文件: <b style="color:var(--orange)">${esc(d.current_file)}</b><br>`;
+      html += `步骤: ${esc(s)} · 用时 ${Math.floor((d.elapsed||0)/60)}分${(d.elapsed||0)%60}秒`;
+    } else if(d.error){
+      html = `<span style="color:var(--red)">❌ ${esc(d.error)}</span>`;
+    } else if(s){
+      html = `<span style="color:var(--green)">✅ ${esc(s)}</span>`;
+    } else {
+      html = '空闲';
+    }
+    document.getElementById('mpStatus').innerHTML = html;
+    const files = d.output_files||[];
+    document.getElementById('mpFiles').innerHTML = files.length
+      ? '📁 已生成输出文件:<br>' + files.map(f=>esc(f)).join('<br>')
+      : '';
+  }catch(e){}
+}
 async function startWorker(){await fetch('/api/start',{method:'POST'});fetchWorkerStatus();}
 async function stopWorker(){
   if(!confirm('确定停止 Worker？正在处理的任务会跑完后退出。'))return;
@@ -1171,9 +1667,148 @@ fetchWorkerStatus();
 fetchConvertStatus();
 setInterval(fetchWorkerStatus,1500);
 setInterval(fetchConvertStatus,1500);
+setInterval(fetchManualStatus,1500);
 setInterval(fetchLogs,800);
 setInterval(fetchConvertLogs,800);
+fetchManualStatus();
+
+// ==================== 目录浏览 ====================
+let _browserMode = 'file'; // 'file' = 选源文件, 'dir' = 选输出目录
+let _browserCurrent = '';
+let _browserSelected = [];
+
+async function openBrowser(mode){
+  _browserMode = mode;
+  _browserSelected = [];
+  document.getElementById('browserModal').style.display = 'flex';
+  document.getElementById('browserTitle').textContent = mode === 'file' ? '选择源音频文件（可多选）' : '选择输出目录';
+  document.getElementById('browserSelectBtn').style.display = mode === 'dir' ? 'inline-block' : 'none';
+  document.getElementById('browserHint').textContent = mode === 'file' ? '点击文件添加到列表，点击文件夹进入' : '导航到目标目录后点「选择此目录」';
+  await browserLoad('');
+}
+
+function closeBrowser(){
+  document.getElementById('browserModal').style.display = 'none';
+}
+
+async function browserLoad(path){
+  _browserCurrent = path;
+  document.getElementById('browserPath').textContent = path || '此电脑';
+  try{
+    const r = await fetch('/api/browse?path=' + encodeURIComponent(path));
+    const d = await r.json();
+    const list = document.getElementById('browserList');
+    let html = '';
+    if(d.error){
+      html = '<div style="color:var(--red);padding:20px;text-align:center">❌ ' + d.error + '</div>';
+    } else {
+      for(const item of d.dirs){
+        const icon = item.type === 'drive' ? '💽' : '📁';
+        html += '<div class="browser-item" data-type="dir" data-path="' + item.path.replace(/"/g,'&quot;') + '" style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;cursor:pointer;font-size:12px;transition:.12s">' +
+          '<span style="font-size:15px">' + icon + '</span>' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + item.name + '</span>' +
+          '<span style="color:var(--muted);font-size:10px">文件夹</span>' +
+        '</div>';
+      }
+      for(const f of d.files){
+        const selected = _browserSelected.includes(f.path);
+        const sizeMB = (f.size / 1048576).toFixed(1);
+        html += '<div class="browser-item" data-type="file" data-path="' + f.path.replace(/"/g,'&quot;') + '" style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;cursor:pointer;font-size:12px;transition:.12s;background:' + (selected ? 'rgba(20,184,166,.15)' : 'transparent') + '">' +
+          '<span style="font-size:15px">' + (selected ? '✅' : '🎵') + '</span>' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + f.name + '</span>' +
+          '<span style="color:var(--muted);font-size:10px">' + sizeMB + ' MB</span>' +
+        '</div>';
+      }
+      if(!d.dirs.length && !d.files.length){
+        html = '<div style="color:var(--muted);padding:30px;text-align:center;font-size:12px">（空目录）</div>';
+      }
+    }
+    list.innerHTML = html;
+    // 事件委托：处理点击
+    list.querySelectorAll('.browser-item').forEach(el => {
+      el.addEventListener('click', function(){
+        const p = this.getAttribute('data-path');
+        const t = this.getAttribute('data-type');
+        if(t === 'dir'){
+          browserLoad(p);
+        } else {
+          browserToggleFile(p);
+        }
+      });
+      el.addEventListener('mouseenter', function(){ this.style.background = 'rgba(255,255,255,.06)'; });
+      el.addEventListener('mouseleave', function(){
+        const p = this.getAttribute('data-path');
+        this.style.background = _browserSelected.includes(p) ? 'rgba(20,184,166,.15)' : 'transparent';
+      });
+    });
+    if(_browserMode === 'file' && _browserSelected.length > 0){
+      document.getElementById('browserHint').textContent = '已选 ' + _browserSelected.length + ' 个文件，点「确认添加」';
+    }
+  }catch(e){
+    document.getElementById('browserList').innerHTML = '<div style="color:var(--red);padding:20px">加载失败：' + e.message + '</div>';
+  }
+}
+
+function browserGoUp(){
+  if(!_browserCurrent) return;
+  const parent = _browserCurrent.substring(0, _browserCurrent.lastIndexOf('\\'));
+  browserLoad(parent || '');
+}
+
+function browserToggleFile(path){
+  const idx = _browserSelected.indexOf(path);
+  if(idx >= 0){
+    _browserSelected.splice(idx, 1);
+  } else {
+    _browserSelected.push(path);
+  }
+  browserLoad(_browserCurrent);
+  const btn = document.getElementById('browserSelectBtn');
+  if(_browserMode === 'file'){
+    if(_browserSelected.length > 0){
+      btn.style.display = 'inline-block';
+      btn.textContent = '✅ 确认添加(' + _browserSelected.length + ')';
+    } else {
+      btn.style.display = 'none';
+    }
+  }
+}
+
+function browserConfirm(){
+  if(_browserMode === 'dir'){
+    document.getElementById('mpOutput').value = _browserCurrent;
+    closeBrowser();
+  } else {
+    // 文件模式：把已选文件添加到 textarea
+    const ta = document.getElementById('mpInput');
+    const existing = ta.value.trim();
+    const newPaths = _browserSelected.join('\n');
+    ta.value = existing ? existing + '\n' + newPaths : newPaths;
+    closeBrowser();
+  }
+}
+
 </script>
+
+<!-- ==================== 目录浏览模态框 ==================== -->
+<div id="browserModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:9999;justify-content:center;align-items:center">
+  <div style="background:var(--bg);border:1px solid var(--border);border-radius:14px;width:600px;max-height:80vh;display:flex;flex-direction:column;overflow:hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border)">
+      <div style="font-size:14px;font-weight:700" id="browserTitle">选择文件</div>
+      <button onclick="closeBrowser()" style="background:none;border:none;color:var(--muted);font-size:18px;cursor:pointer">✕</button>
+    </div>
+    <div style="padding:10px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
+      <button class="btn" style="padding:4px 10px;font-size:11px" onclick="browserGoUp()">⬆ 上级</button>
+      <span id="browserPath" style="font-size:11px;color:var(--muted);font-family:Consolas,monospace;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+    </div>
+    <div id="browserList" style="flex:1;overflow-y:auto;padding:8px 18px"></div>
+    <div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+      <span id="browserHint" style="font-size:11px;color:var(--muted)"></span>
+      <button class="btn btn-start" id="browserSelectBtn" style="display:none;padding:6px 16px;font-size:12px" onclick="browserConfirm()">✅ 选择此目录</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
 """
@@ -1228,6 +1863,9 @@ def main():
 
     # ConvertManager（FLAC 音频转码）
     convert_manager = ConvertManager(a.python or sys.executable, os.path.dirname(os.path.abspath(__file__)))
+
+    # ManualTaskManager（自定义文件手动处理）
+    manual_manager = ManualTaskManager()
 
     print(f'=' * 60)
     print(f'墨墨爱K歌 · AI 分离工作站 启动')
