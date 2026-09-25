@@ -561,6 +561,30 @@ convert_manager = None
 manual_manager = None
 log_collector = None
 
+# 已建立的 SMB 共享连接列表（供浏览根目录显示「网络/SMB 共享」入口）
+# 元素: {'share': '\\\\server\\share', 'user': 'xxx'}
+_smb_connections = []
+
+
+def _net_use_connect(share, user='', pw=''):
+    # 用 Windows 原生命令 net use 建立 SMB 连接（参考 flac_convert.py ensure_share）
+    if not (share or '').startswith('\\\\'):
+        return False, 'SMB 路径必须以 \\\\ 开头'
+
+    def _run(args):
+        return subprocess.run(['net', 'use'] + args, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, errors='replace')
+
+    _run([share, '/delete', '/y'])  # 清掉旧的 Unavailable 连接，忽略错误
+    if user and pw:
+        r = _run([share, '/user:' + user, pw])
+    else:
+        r = _run([share])  # 依赖当前已缓存凭据/匿名访问
+    ok = os.path.exists(share)
+    if not ok:
+        return False, (r.stdout or '连接失败').strip()[:300]
+    return True, ''
+
 
 # ============================================================================
 # HTTP 请求处理器
@@ -705,21 +729,76 @@ class StationHandler(BaseHTTPRequestHandler):
         elif path == '/api/manual/stop':
             ok, msg = manual_manager.stop()
             self._send_json({'ok': ok, 'msg': msg})
+        elif path == '/api/browse/smb-connect':
+            # 建立 SMB 连接，body: {share:'\\\\server\\share', user:'', pass:''}
+            share = (data.get('share') or '').strip()
+            user = (data.get('user') or '').strip()
+            pw = data.get('pass') or ''
+            if not share:
+                self._send_json({'ok': False, 'error': 'share 不能为空'})
+                return
+            share = os.path.normpath(share)
+            ok, err = _net_use_connect(share, user, pw)
+            if ok:
+                # 去重后保存到全局列表
+                exists = any(c['share'] == share for c in _smb_connections)
+                if not exists:
+                    _smb_connections.append({'share': share, 'user': user})
+                self._send_json({'ok': True, 'share': share})
+            else:
+                self._send_json({'ok': False, 'error': err})
         else:
             self._send_json({'error': 'not found'}, 404)
 
     def _list_dir(self, dir_path):
-        """目录浏览：返回子目录和音频文件列表"""
+        """目录浏览：返回子目录和音频文件列表。支持本地盘 / UNC(SMB) 路径。"""
         import string as _string
         audio_exts = {'.flac','.wav','.mp3','.m4a','.ape','.ogg','.aac','.wma','.dsf','.dff','.strm'}
         try:
+            # ---- 根目录：本地驱动器 + 「网络/SMB 共享」入口 ----
             if not dir_path or dir_path == '/':
                 drives = []
                 for c in _string.ascii_uppercase:
                     d = c + ':\\'
                     if os.path.exists(d):
                         drives.append({'name': d, 'path': d, 'type': 'drive'})
+                # 增加 SMB 根入口
+                drives.append({'name': '网络/SMB 共享', 'path': 'smb://', 'type': 'smb_root'})
                 return {'path': '', 'parent': '', 'dirs': drives, 'files': []}
+
+            # ---- SMB 虚拟根：列出已连接的共享 + 「添加新SMB共享」入口 ----
+            if dir_path == 'smb://':
+                dirs = []
+                for c in _smb_connections:
+                    share = c['share']
+                    dirs.append({'name': share, 'path': share, 'type': 'dir'})
+                dirs.append({'name': '➕ 添加新SMB共享', 'path': '__smb_add__', 'type': 'smb_add'})
+                return {'path': 'smb://', 'parent': '', 'dirs': dirs, 'files': []}
+
+            # ---- UNC 路径（\\server\share\...）：规范化后直接 listdir ----
+            if dir_path.startswith('\\\\'):
+                dir_path = os.path.normpath(dir_path)
+                if not os.path.isdir(dir_path):
+                    return {'path': dir_path, 'parent': '', 'dirs': [], 'files': [],
+                            'error': 'SMB连接失败，请检查凭据或网络（目录不存在或未连接）'}
+                parent = os.path.dirname(dir_path)
+                dirs = []
+                files = []
+                for name in sorted(os.listdir(dir_path)):
+                    full = os.path.join(dir_path, name)
+                    try:
+                        if os.path.isdir(full):
+                            dirs.append({'name': name, 'path': full, 'type': 'dir'})
+                        else:
+                            ext = os.path.splitext(name)[1].lower()
+                            if ext in audio_exts:
+                                size = os.path.getsize(full)
+                                files.append({'name': name, 'path': full, 'type': 'file', 'size': size})
+                    except Exception:
+                        pass
+                return {'path': dir_path, 'parent': parent, 'dirs': dirs, 'files': files}
+
+            # ---- 本地路径：原逻辑 ----
             dir_path = os.path.normpath(dir_path)
             if not os.path.isdir(dir_path):
                 return {'path': dir_path, 'parent': '', 'dirs': [], 'files': [], 'error': '目录不存在'}
@@ -1093,7 +1172,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     <div class="form-item">
       <label>任务类型</label>
       <select id="manualType">
-        <option value="both">分离+对齐（先分离后对齐）</option>
+        <!-- both 现为"自动判断"：服务端按 sep_status/align_status 决定只对齐还是分离+对齐 -->
+        <option value="both" selected>自动判断（推荐：已分离只对齐，未分离分离+对齐）</option>
         <option value="separate">仅人声分离</option>
         <option value="align">仅逐字对齐</option>
       </select>
@@ -1497,8 +1577,10 @@ async function manualEnqueue(){
   const force = document.getElementById('manualForce').value === 'true';
   const r = await fetch('/api/manual/enqueue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({song_ids:ids,type,force})});
   const d = await r.json();
-  document.getElementById('manualResult').innerHTML =
-    d.ok ? `✅ 已入队 <b style="color:var(--green)">${d.added||0}</b> 个任务，跳过 <b>${d.skipped||0}</b> 个` : `❌ 失败：${esc(d.error||'')}`;
+  // 利用服务端新增的 separate_added/align_added/auto_skipped 展示详细分类统计
+  document.getElementById('manualResult').innerHTML = d.ok
+    ? `✅ 入队完成：新增分离任务 <b style="color:var(--green)">${d.separate_added||0}</b> 个，对齐任务 <b style="color:var(--green)">${d.align_added||0}</b> 个，自动跳过已完成 <b>${d.auto_skipped||0}</b> 首`
+    : `❌ 失败：${esc(d.error||'')}`;
 }
 async function manualUploadLyrics(){
   const ids = parseIds(document.getElementById('manualIds').value);
@@ -1703,11 +1785,15 @@ async function browserLoad(path){
       html = '<div style="color:var(--red);padding:20px;text-align:center">❌ ' + d.error + '</div>';
     } else {
       for(const item of d.dirs){
-        const icon = item.type === 'drive' ? '💽' : '📁';
-        html += '<div class="browser-item" data-type="dir" data-path="' + item.path.replace(/"/g,'&quot;') + '" style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;cursor:pointer;font-size:12px;transition:.12s">' +
+        let icon = '📁';
+        let tag = '文件夹';
+        if(item.type === 'drive'){ icon = '💽'; tag = '本地磁盘'; }
+        else if(item.type === 'smb_root'){ icon = '🌐'; tag = '网络'; }
+        else if(item.type === 'smb_add'){ icon = '➕'; tag = '添加'; }
+        html += '<div class="browser-item" data-type="dir" data-path="' + item.path.replace(/"/g,'&quot;') + '" data-subtype="' + (item.type||'') + '" style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;cursor:pointer;font-size:12px;transition:.12s">' +
           '<span style="font-size:15px">' + icon + '</span>' +
           '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + item.name + '</span>' +
-          '<span style="color:var(--muted);font-size:10px">文件夹</span>' +
+          '<span style="color:var(--muted);font-size:10px">' + tag + '</span>' +
         '</div>';
       }
       for(const f of d.files){
@@ -1729,8 +1815,18 @@ async function browserLoad(path){
       el.addEventListener('click', function(){
         const p = this.getAttribute('data-path');
         const t = this.getAttribute('data-type');
+        const st = this.getAttribute('data-subtype') || '';
         if(t === 'dir'){
-          browserLoad(p);
+          if(st === 'smb_root'){
+            // 进入 SMB 虚拟根（已连接共享列表）
+            browserLoad('smb://');
+          } else if(st === 'smb_add'){
+            // 显示 SMB 连接表单
+            showSmbForm();
+            document.getElementById('smbShare').focus();
+          } else {
+            browserLoad(p);
+          }
         } else {
           browserToggleFile(p);
         }
@@ -1751,8 +1847,53 @@ async function browserLoad(path){
 
 function browserGoUp(){
   if(!_browserCurrent) return;
+  // SMB 虚拟根：回到本机根
+  if(_browserCurrent === 'smb://'){ browserLoad(''); return; }
+  // UNC 路径 \\server\share\sub：上级逐级退到 \\server\share 后再回根
+  if(_browserCurrent.startsWith('\\\\')){
+    const idx = _browserCurrent.lastIndexOf('\\');
+    const parent = _browserCurrent.substring(0, idx);
+    // 数反斜杠个数：\\server\share 有2个反斜杠，上级回到本机根；更深的目录逐级退
+    const bsCount = (parent.match(/\\/g) || []).length;
+    if(bsCount <= 2){
+      browserLoad('');
+    } else {
+      browserLoad(parent);
+    }
+    return;
+  }
+  // 普通本地路径
   const parent = _browserCurrent.substring(0, _browserCurrent.lastIndexOf('\\'));
   browserLoad(parent || '');
+}
+
+// SMB 连接表单：展开/收起
+function showSmbForm(){
+  const f = document.getElementById('smbForm');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+}
+
+// 提交 SMB 连接
+async function smbConnect(){
+  const share = document.getElementById('smbShare').value.trim();
+  const user = document.getElementById('smbUser').value.trim();
+  const pass = document.getElementById('smbPass').value;
+  const statusEl = document.getElementById('smbStatus');
+  if(!share){ statusEl.textContent = '请输入SMB共享路径'; statusEl.style.color = 'var(--red)'; return; }
+  statusEl.textContent = '正在连接...'; statusEl.style.color = 'var(--muted)';
+  try{
+    const r = await fetch('/api/browse/smb-connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({share,user,pass})});
+    const d = await r.json();
+    if(d.ok){
+      statusEl.textContent = '✅ 连接成功'; statusEl.style.color = 'var(--green)';
+      document.getElementById('smbForm').style.display = 'none';
+      browserLoad(d.share);  // 连接成功后直接进入该共享目录
+    } else {
+      statusEl.textContent = '❌ ' + (d.error || '连接失败'); statusEl.style.color = 'var(--red)';
+    }
+  }catch(e){
+    statusEl.textContent = '❌ ' + e.message; statusEl.style.color = 'var(--red)';
+  }
 }
 
 function browserToggleFile(path){
@@ -1799,7 +1940,17 @@ function browserConfirm(){
     </div>
     <div style="padding:10px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
       <button class="btn" style="padding:4px 10px;font-size:11px" onclick="browserGoUp()">⬆ 上级</button>
+      <button class="btn" style="padding:4px 10px;font-size:11px" onclick="showSmbForm()">🔗 SMB</button>
       <span id="browserPath" style="font-size:11px;color:var(--muted);font-family:Consolas,monospace;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+    </div>
+    <div id="smbForm" style="display:none;padding:10px 18px;border-bottom:1px solid var(--border);background:var(--bg2)">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <input type="text" id="smbShare" placeholder="\\服务器\共享名" style="flex:1;min-width:180px;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;font-family:Consolas,monospace">
+        <input type="text" id="smbUser" placeholder="用户名(可空)" style="width:100px;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px">
+        <input type="password" id="smbPass" placeholder="密码(可空)" style="width:100px;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px">
+        <button class="btn btn-start" style="padding:5px 12px;font-size:11px" onclick="smbConnect()">连接</button>
+      </div>
+      <div id="smbStatus" style="font-size:11px;color:var(--muted);margin-top:6px"></div>
     </div>
     <div id="browserList" style="flex:1;overflow-y:auto;padding:8px 18px"></div>
     <div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
