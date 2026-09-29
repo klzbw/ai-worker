@@ -562,27 +562,111 @@ manual_manager = None
 log_collector = None
 
 # 已建立的 SMB 共享连接列表（供浏览根目录显示「网络/SMB 共享」入口）
-# 元素: {'share': '\\\\server\\share', 'user': 'xxx'}
+# 元素: {'share': '\\\\server\\share' 或 '\\\\server', 'user': 'xxx'}
 _smb_connections = []
+
+# 已认证的 SMB 服务器会话凭据缓存：server -> {'user': 'xxx', 'pass': 'xxx'}
+# 仅输入服务器名(\\server)时，先连 IPC$ 建立认证会话，再用 net view 枚举共享；
+# 之后浏览该服务器任意共享都复用此会话，无需逐个 net use。
+_smb_sessions = {}
+
+
+def _oem_encoding():
+    # net.exe 等控制台命令按 OEM 代码页输出（中文系统为 cp936/GBK），与 Python 默认的 UTF-8 不同。
+    # 动态获取 OEM 代码页，拿不到时回退 GBK。
+    try:
+        import ctypes
+        return 'cp%d' % ctypes.windll.kernel32.GetOEMCP()
+    except Exception:
+        return 'gbk'
+
+
+def _decode_console(raw):
+    # 把命令输出的原始字节按 OEM 代码页解码；兼容已是 str 的情况，逐级回退避免乱码。
+    if raw is None:
+        return ''
+    if isinstance(raw, str):
+        return raw
+    for enc in (_oem_encoding(), 'gbk', 'utf-8'):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode('gbk', errors='replace')
+
+
+def _split_unc(unc):
+    # 解析 UNC 路径，返回 (server, share, rest_parts)；只有服务器名时 share 为 None。
+    # 同时兼容正斜杠与被 normpath 折叠成单反斜杠的情况。
+    parts = [p for p in re.split(r'[\\/]+', (unc or '').replace('/', '\\')) if p]
+    if not parts:
+        return None, None, []
+    server = parts[0]
+    share = parts[1] if len(parts) > 1 else None
+    return server, share, parts[2:]
+
+
+def _run_net_use(args):
+    # 调用 net use 并返回 (returncode, 解码后文本)。捕获原始字节再按 OEM 解码，修复错误信息乱码。
+    r = subprocess.run(['net', 'use'] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return r.returncode, _decode_console(r.stdout)
+
+
+def _net_use_ipc(server, user='', pw=''):
+    # 连接 \\server\IPC$ 建立到整台服务器的认证会话（net use 不允许只连 \\server）。
+    # 会话建立后即可用 net view 枚举共享、直接访问该服务器任意共享。
+    target = r'\\%s\IPC$' % server
+    _run_net_use([target, '/delete', '/y'])  # 清掉旧的 IPC 连接，忽略错误
+    if user and pw:
+        rc, txt = _run_net_use([target, '/user:' + user, pw])
+    else:
+        rc, txt = _run_net_use([target])  # 依赖当前已缓存凭据/匿名访问
+    if rc != 0:
+        return False, txt.strip()[:300] or '连接服务器失败'
+    return True, ''
+
+
+def _enum_shares(server):
+    # 用 net view \\server 枚举服务器上的所有共享，返回 (共享名列表, 错误文本)。
+    r = subprocess.run(['net', 'view', r'\\%s' % server],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    txt = _decode_console(r.stdout)
+    if r.returncode != 0:
+        return None, txt.strip()[:300] or '无法枚举共享（网络路径未找到或无权限）'
+    shares = []
+    started = False
+    for line in txt.splitlines():
+        s = line.rstrip()
+        if not started:
+            # 表格以一行全是连字符的分隔线开始
+            if s.strip() and set(s.strip()) == set('-'):
+                started = True
+            continue
+        if not s.strip():
+            continue
+        low = s.strip().lower()
+        if low.startswith('the command completed') or low.startswith('the command'):
+            break
+        # 表格各列以 2 个以上空格分隔；首列即共享名（共享名单个空格也能保留）
+        cols = re.split(r'\s{2,}', s.strip())
+        if len(cols) >= 2 and cols[0].strip().lower() != 'share name':
+            shares.append(cols[0].strip())
+    return shares, ''
 
 
 def _net_use_connect(share, user='', pw=''):
-    # 用 Windows 原生命令 net use 建立 SMB 连接（参考 flac_convert.py ensure_share）
-    if not (share or '').startswith('\\\\'):
+    # 用 Windows 原生命令 net use 建立到具体共享的连接（参考 flac_convert.py ensure_share）
+    if not (share or '').startswith('\\'):
         return False, 'SMB 路径必须以 \\\\ 开头'
 
-    def _run(args):
-        return subprocess.run(['net', 'use'] + args, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, text=True, errors='replace')
-
-    _run([share, '/delete', '/y'])  # 清掉旧的 Unavailable 连接，忽略错误
+    _run_net_use([share, '/delete', '/y'])  # 清掉旧的 Unavailable 连接，忽略错误
     if user and pw:
-        r = _run([share, '/user:' + user, pw])
+        rc, txt = _run_net_use([share, '/user:' + user, pw])
     else:
-        r = _run([share])  # 依赖当前已缓存凭据/匿名访问
+        rc, txt = _run_net_use([share])  # 依赖当前已缓存凭据/匿名访问
     ok = os.path.exists(share)
     if not ok:
-        return False, (r.stdout or '连接失败').strip()[:300]
+        return False, txt.strip()[:300] or '连接失败'
     return True, ''
 
 
@@ -730,28 +814,51 @@ class StationHandler(BaseHTTPRequestHandler):
             ok, msg = manual_manager.stop()
             self._send_json({'ok': ok, 'msg': msg})
         elif path == '/api/browse/smb-connect':
-            # 建立 SMB 连接，body: {share:'\\\\server\\share', user:'', pass:''}
-            share = (data.get('share') or '').strip()
+            # 建立 SMB 连接，body: {share:'\\server' 或 '\\server\share', user:'', pass:''}
+            raw_share = (data.get('share') or '').strip()
             user = (data.get('user') or '').strip()
             pw = data.get('pass') or ''
-            if not share:
+            if not raw_share:
                 self._send_json({'ok': False, 'error': 'share 不能为空'})
                 return
-            share = os.path.normpath(share)
-            # os.path.normpath 会把仅含服务器名的 \\server 折叠成 \server，破坏 UNC 双反斜杠前缀，
-            # 使后续 _net_use_connect 的 startswith('\\\\') 校验误报“SMB 路径必须以 \\ 开头”。
-            # 这里把被折叠掉的 UNC 双反斜杠前缀补回。
-            if share.startswith('\\') and not share.startswith('\\\\'):
-                share = '\\' + share
-            ok, err = _net_use_connect(share, user, pw)
-            if ok:
-                # 去重后保存到全局列表
-                exists = any(c['share'] == share for c in _smb_connections)
-                if not exists:
-                    _smb_connections.append({'share': share, 'user': user})
-                self._send_json({'ok': True, 'share': share})
-            else:
-                self._send_json({'ok': False, 'error': err})
+            # 用 _split_unc 解析，天然兼容正斜杠并避免 normpath 把 \\server 折叠成 \server
+            server, sh, rest = _split_unc(raw_share)
+            if not server:
+                self._send_json({'ok': False, 'error': '无法解析服务器名（应以 \\服务器 开头）'})
+                return
+            server_unc = r'\\%s' % server
+
+            if sh is None:
+                # ---- 只有服务器名：先连 IPC$ 建立认证会话，再枚举共享 ----
+                ok, err = _net_use_ipc(server, user, pw)
+                if not ok:
+                    self._send_json({'ok': False, 'error': '连接服务器失败：' + err})
+                    return
+                _smb_sessions[server] = {'user': user, 'pass': pw}
+                shares, serr = _enum_shares(server)
+                if shares is None:
+                    self._send_json({'ok': False, 'error': '无法列出共享：' + serr})
+                    return
+                if not any(c['share'] == server_unc for c in _smb_connections):
+                    _smb_connections.append({'share': server_unc, 'user': user})
+                self._send_json({'ok': True, 'share': server_unc})
+                return
+
+            # ---- 指定了共享名：连 IPC$ 认证（授权该服务器所有共享），再校验目标共享 ----
+            share_root = r'\\%s\%s' % (server, sh)
+            target_path = share_root + (('\\' + '\\'.join(rest)) if rest else '')
+            ok, err = _net_use_ipc(server, user, pw)
+            if not ok:
+                # 回退：直接对共享 net use（个别环境 IPC 受限）
+                ok, err = _net_use_connect(share_root, user, pw)
+            if not ok or not os.path.isdir(share_root):
+                self._send_json({'ok': False,
+                                 'error': '无法访问共享 %s：%s' % (sh, err or '共享不存在或无权限')})
+                return
+            _smb_sessions[server] = {'user': user, 'pass': pw}
+            if not any(c['share'] == share_root for c in _smb_connections):
+                _smb_connections.append({'share': share_root, 'user': user})
+            self._send_json({'ok': True, 'share': target_path})
         else:
             self._send_json({'error': 'not found'}, 404)
 
@@ -780,17 +887,51 @@ class StationHandler(BaseHTTPRequestHandler):
                 dirs.append({'name': '➕ 添加新SMB共享', 'path': '__smb_add__', 'type': 'smb_add'})
                 return {'path': 'smb://', 'parent': '', 'dirs': dirs, 'files': []}
 
-            # ---- UNC 路径（\\server\share\...）：规范化后直接 listdir ----
-            if dir_path.startswith('\\\\'):
-                dir_path = os.path.normpath(dir_path)
-                if not os.path.isdir(dir_path):
+            # ---- UNC 路径：\\server 列出共享；\\server\share[\sub] 列出文件 ----
+            if dir_path.startswith('\\'):
+                server, sh, rest = _split_unc(dir_path)
+                if not server:
                     return {'path': dir_path, 'parent': '', 'dirs': [], 'files': [],
-                            'error': 'SMB连接失败，请检查凭据或网络（目录不存在或未连接）'}
-                parent = os.path.dirname(dir_path)
+                            'error': 'SMB 路径无法解析服务器名'}
+                server_unc = r'\\%s' % server
+
+                # 只有服务器名：枚举该服务器所有共享
+                if sh is None:
+                    shares, serr = _enum_shares(server)
+                    if shares is None:
+                        # 若缓存了凭据，尝试重建 IPC 会话后再枚举一次
+                        sess = _smb_sessions.get(server)
+                        if sess:
+                            _net_use_ipc(server, sess['user'], sess['pass'])
+                            shares, serr = _enum_shares(server)
+                    if shares is None:
+                        return {'path': server_unc, 'parent': 'smb://', 'dirs': [], 'files': [],
+                                'error': '无法列出共享：%s（可点「SMB」输入服务器、用户名、密码后连接）' % (serr or '无权限')}
+                    dirs = [{'name': s, 'path': r'\\%s\%s' % (server, s), 'type': 'smb_share'}
+                            for s in shares]
+                    return {'path': server_unc, 'parent': 'smb://', 'dirs': dirs, 'files': []}
+
+                # 指定了共享：列出其中的子目录与音频文件
+                share_root = r'\\%s\%s' % (server, sh)
+                full_dir = share_root + (('\\' + '\\'.join(rest)) if rest else '')
+                if not os.path.isdir(full_dir):
+                    # 用缓存凭据重建会话后重试
+                    sess = _smb_sessions.get(server)
+                    if sess:
+                        _net_use_ipc(server, sess['user'], sess['pass'])
+                    if not os.path.isdir(full_dir):
+                        return {'path': full_dir, 'parent': '', 'dirs': [], 'files': [],
+                                'error': 'SMB连接失败，请检查凭据或网络（共享不存在或未连接）'}
+                if not rest:
+                    parent = server_unc  # 共享根的上级回到服务器共享列表
+                elif len(rest) == 1:
+                    parent = share_root
+                else:
+                    parent = share_root + '\\' + '\\'.join(rest[:-1])
                 dirs = []
                 files = []
-                for name in sorted(os.listdir(dir_path)):
-                    full = os.path.join(dir_path, name)
+                for name in sorted(os.listdir(full_dir)):
+                    full = os.path.join(full_dir, name)
                     try:
                         if os.path.isdir(full):
                             dirs.append({'name': name, 'path': full, 'type': 'dir'})
@@ -801,7 +942,7 @@ class StationHandler(BaseHTTPRequestHandler):
                                 files.append({'name': name, 'path': full, 'type': 'file', 'size': size})
                     except Exception:
                         pass
-                return {'path': dir_path, 'parent': parent, 'dirs': dirs, 'files': files}
+                return {'path': full_dir, 'parent': parent, 'dirs': dirs, 'files': files}
 
             # ---- 本地路径：原逻辑 ----
             dir_path = os.path.normpath(dir_path)
@@ -1795,6 +1936,7 @@ async function browserLoad(path){
         if(item.type === 'drive'){ icon = '💽'; tag = '本地磁盘'; }
         else if(item.type === 'smb_root'){ icon = '🌐'; tag = '网络'; }
         else if(item.type === 'smb_add'){ icon = '➕'; tag = '添加'; }
+        else if(item.type === 'smb_share'){ icon = '📂'; tag = '共享'; }
         html += '<div class="browser-item" data-type="dir" data-path="' + item.path.replace(/"/g,'&quot;') + '" data-subtype="' + (item.type||'') + '" style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;cursor:pointer;font-size:12px;transition:.12s">' +
           '<span style="font-size:15px">' + icon + '</span>' +
           '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + item.name + '</span>' +
@@ -1851,24 +1993,20 @@ async function browserLoad(path){
 }
 
 function browserGoUp(){
-  if(!_browserCurrent) return;
+  const cur = _browserCurrent;
+  if(!cur) return;
   // SMB 虚拟根：回到本机根
-  if(_browserCurrent === 'smb://'){ browserLoad(''); return; }
-  // UNC 路径 \\server\share\sub：上级逐级退到 \\server\share 后再回根
-  if(_browserCurrent.startsWith('\\\\')){
-    const idx = _browserCurrent.lastIndexOf('\\');
-    const parent = _browserCurrent.substring(0, idx);
-    // 数反斜杠个数：\\server\share 有2个反斜杠，上级回到本机根；更深的目录逐级退
-    const bsCount = (parent.match(/\\/g) || []).length;
-    if(bsCount <= 2){
-      browserLoad('');
-    } else {
-      browserLoad(parent);
-    }
+  if(cur === 'smb://'){ browserLoad(''); return; }
+  // UNC 路径：按层级回退。\\server(共享列表)->smb根；\\server\share->\\server；更深逐级退
+  if(cur.startsWith('\\\\')){
+    const parts = cur.replace(/^\\+/, '').split('\\').filter(Boolean);
+    parts.pop();
+    const target = parts.length ? ('\\\\' + parts.join('\\')) : 'smb://';
+    browserLoad(target);
     return;
   }
   // 普通本地路径
-  const parent = _browserCurrent.substring(0, _browserCurrent.lastIndexOf('\\'));
+  const parent = cur.substring(0, cur.lastIndexOf('\\'));
   browserLoad(parent || '');
 }
 
