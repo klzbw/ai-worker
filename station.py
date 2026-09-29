@@ -738,6 +738,11 @@ class StationHandler(BaseHTTPRequestHandler):
                 self._send_json({'ok': False, 'error': 'share 不能为空'})
                 return
             share = os.path.normpath(share)
+            # os.path.normpath 会把仅含服务器名的 \\server 折叠成 \server，破坏 UNC 双反斜杠前缀，
+            # 使后续 _net_use_connect 的 startswith('\\\\') 校验误报“SMB 路径必须以 \\ 开头”。
+            # 这里把被折叠掉的 UNC 双反斜杠前缀补回。
+            if share.startswith('\\') and not share.startswith('\\\\'):
+                share = '\\' + share
             ok, err = _net_use_connect(share, user, pw)
             if ok:
                 # 去重后保存到全局列表
