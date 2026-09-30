@@ -17,7 +17,7 @@
   python worker.py --server http://192.168.3.16:8083 --worker pc-51 --mode both
   --mode 可选 separate（只分离）/ align（只对齐）/ both（先分离后对齐，默认）
 """
-import argparse, os, sys, time, subprocess, tempfile, shutil, urllib.parse, re, json, threading
+import argparse, os, sys, time, subprocess, tempfile, shutil, urllib.parse, re, json, threading, socket
 import requests
 
 # Windows GBK控制台无法输出部分Unicode字符(如子进程错误里的\ufffd)，强制UTF-8避免log时主进程崩溃
@@ -301,13 +301,28 @@ class MomoWorker:
     # 修复：端到端测试问题1——115网盘间歇性403。
     _download_lock = threading.Lock()
 
-    def __init__(self, server, worker, mode, python_exe, capability=None):
+    def __init__(self, server, worker, mode, python_exe, capability=None,
+                 alist_tunnel=None, alist_port=5345):
         self.server = server.rstrip('/')
         self.worker = worker
         self.mode = mode
         self.py = python_exe or sys.executable
         self.here = os.path.dirname(os.path.abspath(__file__))
         self.s = requests.Session()
+        # 115 403 根因（实测交叉验证确认，非源IP问题）：AList 的 115 驱动/115 服务端会按
+        # “请求方 User-Agent” 决定是否下发下载链接。实测特定旧版 requests 默认 UA
+        # “python-requests/2.31.0” 被 100% 拒绝(403，反复重试无效)；而 curl 风格 UA、
+        # 新版 requests(2.34.2) 默认 UA 均 100% 成功(206，单线程与3线程并发皆然)。
+        # 注意原生 curl 程序的完整请求头也可能被拒——关键是经 python-requests 发送时
+        # UA 不命中 “python-requests/2.31.0” 这一黑名单。故把会话 UA 固定为 curl 风格即可
+        # 稳定下载（可用环境变量 MOMO_HTTP_UA 覆盖）。
+        self.s.headers['User-Agent'] = os.environ.get('MOMO_HTTP_UA', 'curl/8.4.0')
+        # SSH 隧道（可选的冗余路径）：隧道存活时把对 AList(:5345) 的请求改走本机回环隧道；
+        # 隧道不可用时自动回退到局域网直连（配合上面的 curl UA，两条路径都能拿到宽松节点）。
+        self.alist_port = int(alist_port or 5345)
+        self.alist_tunnel = alist_tunnel  # 如 'http://127.0.0.1:5345'；None=不使用隧道
+        self._tunnel_check_at = 0.0
+        self._tunnel_check_val = False
         # 算力等级：'gpu'(N卡CUDA) 或 'cpu'。由 entrypoint 探测后通过 MOMO_CAPABILITY
         # 传入；服务端据此做"有GPU优先给GPU、GPU空闲超时才让CPU兜底"的双模调度。
         self.capability = capability or os.environ.get('MOMO_CAPABILITY', 'cpu')
@@ -399,6 +414,35 @@ class MomoWorker:
             pass
         return None
 
+    # 隧道本地端口是否可连（结果缓存10秒，避免每次下载都做一次 TCP 探测）。
+    def _tunnel_alive(self):
+        if not self.alist_tunnel:
+            return False
+        now = time.time()
+        if now < self._tunnel_check_at + 10:
+            return self._tunnel_check_val
+        val = False
+        try:
+            tp = urllib.parse.urlparse(self.alist_tunnel)
+            with socket.create_connection((tp.hostname, tp.port or 80), timeout=2):
+                val = True
+        except Exception:
+            val = False
+        self._tunnel_check_at = now
+        self._tunnel_check_val = val
+        return val
+
+    # 把指向 AList(:5345) 的直链，在隧道存活时改写为走本机回环隧道；不可用/不匹配则原样返回。
+    def _alist_url(self, url):
+        try:
+            p = urllib.parse.urlparse(url)
+            if p.scheme in ('http', 'https') and p.port == self.alist_port and self._tunnel_alive():
+                tp = urllib.parse.urlparse(self.alist_tunnel)
+                return urllib.parse.urlunparse((tp.scheme, tp.netloc, p.path, p.params, p.query, p.fragment))
+        except Exception:
+            pass
+        return url
+
     # 跟随 .strm 里的 URL 下载真实音频，替换文本指针文件，返回真实音频本地路径。
     # 修复问题1：115 CDN 偶发 403/限流，重试从2次增至5次，退避从固定3/6s改为指数5/10/20/40/60s。
     # 调用方（_download_unlocked）已持有 _download_lock，此处不再重复加锁。
@@ -413,8 +457,12 @@ class MomoWorker:
         last_exc = None
         max_attempts = 1 + len(self._STRM_RETRY_BACKOFF)  # 1次首次 + 5次重试 = 6次
         for attempt in range(max_attempts):
+            # 隧道存活则走隧道，否则局域网直连（每次尝试重新判定，隧道恢复后自动切回）
+            fetch_url = self._alist_url(url)
+            if fetch_url != url:
+                log('经 SSH 隧道访问 AList:', fetch_url)
             try:
-                with self.s.get(url, stream=True, timeout=600) as r:
+                with self.s.get(fetch_url, stream=True, timeout=600) as r:
                     if r.status_code in (403, 429, 500, 502, 503, 504):
                         raise RuntimeError(f'源站 HTTP {r.status_code}（可能限流）')
                     r.raise_for_status()
@@ -747,12 +795,21 @@ def main():
     log(f'算力: {cap or "cpu"}')
     log(f'并发线程数: {threads}' + ('（GPU 模式建议 2~3，过多可能显存不足 OOM）' if cap == 'gpu' and threads > 2 else ''))
 
+    # SSH 隧道（冗余路径）：默认启用，隧道存活时 AList 请求走本机回环；不可用自动回退直连。
+    # 可在 worker_config.json 设 use_alist_tunnel=false，或环境变量 MOMO_USE_ALIST_TUNNEL=off 关闭。
+    use_tunnel = str(cfg.get('use_alist_tunnel',
+                             os.environ.get('MOMO_USE_ALIST_TUNNEL', 'yes'))).lower() not in ('0', 'no', 'off', 'false')
+    alist_tunnel = (cfg.get('alist_tunnel', os.environ.get('MOMO_ALIST_TUNNEL', 'http://127.0.0.1:5345'))
+                    if use_tunnel else None)
+    alist_port = int(cfg.get('alist_port', os.environ.get('MOMO_ALIST_PORT', '5345')))
+
     # 多线程：每个线程独立 MomoWorker 实例（独立 requests.Session），各自领任务/调子进程/回传
     # 子进程 sep_once.py / align_once.py 每首歌跑完即退，显存彻底释放，多线程只是让多首同时跑
     ts = []
     for i in range(threads):
         tname = f'W{i+1}'
-        w = MomoWorker(a.server, a.worker, a.mode, a.python, a.capability or None)
+        w = MomoWorker(a.server, a.worker, a.mode, a.python, a.capability or None,
+                       alist_tunnel=alist_tunnel, alist_port=alist_port)
         t = threading.Thread(target=w.loop, name=tname, daemon=True)
         t.start()
         ts.append((t, w))
