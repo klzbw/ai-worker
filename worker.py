@@ -309,14 +309,15 @@ class MomoWorker:
         self.py = python_exe or sys.executable
         self.here = os.path.dirname(os.path.abspath(__file__))
         self.s = requests.Session()
-        # 115 403 根因（实测交叉验证确认，非源IP问题）：AList 的 115 驱动/115 服务端会按
-        # “请求方 User-Agent” 决定是否下发下载链接。实测特定旧版 requests 默认 UA
-        # “python-requests/2.31.0” 被 100% 拒绝(403，反复重试无效)；而 curl 风格 UA、
-        # 新版 requests(2.34.2) 默认 UA 均 100% 成功(206，单线程与3线程并发皆然)。
-        # 注意原生 curl 程序的完整请求头也可能被拒——关键是经 python-requests 发送时
-        # UA 不命中 “python-requests/2.31.0” 这一黑名单。故把会话 UA 固定为 curl 风格即可
-        # 稳定下载（可用环境变量 MOMO_HTTP_UA 覆盖）。
-        self.s.headers['User-Agent'] = os.environ.get('MOMO_HTTP_UA', 'curl/8.4.0')
+        # 115 403 根因（同一文件、同一时刻、仅改变单一变量的对照实验最终锁定）：
+        # AList 的 115 驱动会把“请求方 User-Agent”透传给 115 下载链接接口，115 据此下发
+        # 不同 CDN 节点：curl/7.88.1(Debian 自带 7.x 系列) → 宽松节点 cdnfhnfile.115cdn.net
+        # (c=0,f=空) → 206 成功；curl/8.x(实测 8.4.0 / 8.13.0) → 严格节点 cdnfhnfile.115.com
+        # (c=2,f=3) → 403 “no cookie”，反复重试/指数退避均无效（节点固定）。
+        # 早期“源 IP 决定”是假象：容器内 curl 恰好为 7.88.1，而本机 curl 为 8.x。
+        # 结论：无需 SSH 隧道，纯客户端 302 直连，只要 UA 固定为 curl/7.88.1 即可，
+        # 不占用 NAS 带宽/CPU（可用环境变量 MOMO_HTTP_UA 覆盖）。
+        self.s.headers['User-Agent'] = os.environ.get('MOMO_HTTP_UA', 'curl/7.88.1')
         # SSH 隧道（可选的冗余路径）：隧道存活时把对 AList(:5345) 的请求改走本机回环隧道；
         # 隧道不可用时自动回退到局域网直连（配合上面的 curl UA，两条路径都能拿到宽松节点）。
         self.alist_port = int(alist_port or 5345)
@@ -795,10 +796,11 @@ def main():
     log(f'算力: {cap or "cpu"}')
     log(f'并发线程数: {threads}' + ('（GPU 模式建议 2~3，过多可能显存不足 OOM）' if cap == 'gpu' and threads > 2 else ''))
 
-    # SSH 隧道（冗余路径）：默认启用，隧道存活时 AList 请求走本机回环；不可用自动回退直连。
-    # 可在 worker_config.json 设 use_alist_tunnel=false，或环境变量 MOMO_USE_ALIST_TUNNEL=off 关闭。
+    # SSH 隧道（可选冗余路径）：默认关闭，纯客户端 302 直连 + curl/7.88.1 UA 即可解决 403。
+    # 隧道存活时 AList 请求走本机回环；不可用自动回退直连。
+    # 可在 worker_config.json 设 use_alist_tunnel=true，或环境变量 MOMO_USE_ALIST_TUNNEL=on 启用。
     use_tunnel = str(cfg.get('use_alist_tunnel',
-                             os.environ.get('MOMO_USE_ALIST_TUNNEL', 'yes'))).lower() not in ('0', 'no', 'off', 'false')
+                             os.environ.get('MOMO_USE_ALIST_TUNNEL', 'off'))).lower() not in ('0', 'no', 'off', 'false')
     alist_tunnel = (cfg.get('alist_tunnel', os.environ.get('MOMO_ALIST_TUNNEL', 'http://127.0.0.1:5345'))
                     if use_tunnel else None)
     alist_port = int(cfg.get('alist_port', os.environ.get('MOMO_ALIST_PORT', '5345')))
